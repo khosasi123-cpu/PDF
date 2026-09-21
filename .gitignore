@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+artifacts/extraction/*.json
+artifacts/extraction/*.pdf

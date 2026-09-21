@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+src/pdf_translator/__init__.py
+src/pdf_translator/extractor.py
+src/pdf_translator/filters.py
+src/pdf_translator/main.py
+src/pdf_translator/models.py
+src/pdf_translator/preview.py
+src/pdf_translator.egg-info/PKG-INFO
+src/pdf_translator.egg-info/SOURCES.txt
+src/pdf_translator.egg-info/dependency_links.txt
+src/pdf_translator.egg-info/requires.txt
+src/pdf_translator.egg-info/top_level.txt
+tests/test_extractor.py
+tests/test_filters.py

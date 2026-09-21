@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf-translator"
+version = "0.1.0"
+description = "Phase 1 block-level PDF extraction and visual preview pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["PyMuPDF>=1.28,<2"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

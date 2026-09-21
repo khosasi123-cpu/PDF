@@ -1,0 +1,4 @@
+PyMuPDF<2,>=1.28
+
+[test]
+pytest>=8
