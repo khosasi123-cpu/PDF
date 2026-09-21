@@ -32,11 +32,14 @@ IP addresses, numbers, units, parameter names, URLs, symbols, and code-like valu
 Do not translate part numbers, document IDs, URLs, or values that should remain unchanged.
 The input units are already logically grouped. Do not split, merge, create, or delete units.
 Return ONLY valid JSON in exactly this shape:
-{"translations":[{"id":1,"source":"exact input source","translation":"Indonesian translation"}]}
-The source field is an opaque immutable string copied from the input JSON. Copy it character-for-character,
-including whitespace, punctuation, and incomplete-looking endings. Some source strings may intentionally end
-mid-sentence because the PDF extractor split adjacent blocks; never complete, normalize, or infer source text.
+{"translations":[{"id":1,"translation":"Indonesian translation"}]}
+Do not return a source field. The source text is an opaque immutable value supplied in the input JSON;
+the caller will associate it with the returned ID. Some source strings may intentionally end mid-sentence
+because the PDF extractor split adjacent blocks; never complete, normalize, or infer source text.
 Every input ID must appear exactly once.
+For normal English words and sentences, you MUST actually translate them to Indonesian.
+Do not copy the source text unchanged unless it is an acronym, identifier, product name, code-like value,
+or a term explicitly protected by the terminology context.
 Do not output Chinese or commentary outside the JSON."""
 
 
@@ -57,7 +60,6 @@ class TranslationItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: int
-    source: str
     translation: str = Field(min_length=1)
 
 
@@ -163,21 +165,24 @@ def _clearly_translatable(source: str) -> bool:
 def _validate_translation_item(item: Any, expected: dict[int, dict[str, Any]]) -> dict[str, Any]:
     if not isinstance(item, dict):
         raise BatchValidationError("Each translation must be an object")
-    if set(item) != {"id", "source", "translation"}:
-        raise BatchValidationError("Each translation must contain only id, source, and translation")
+    if set(item) not in ({"id", "translation"}, {"id", "source", "translation"}):
+        raise BatchValidationError("Each translation must contain id and translation only")
     unit_id = item.get("id")
     if not isinstance(unit_id, int) or isinstance(unit_id, bool):
         raise BatchValidationError(f"Invalid translation ID: {unit_id!r}")
     if unit_id not in expected:
         raise BatchValidationError(f"Unexpected translation ID: {unit_id}")
-    if item["source"] != expected[unit_id]["source"]:
+    if "source" in item and item["source"] != expected[unit_id]["source"]:
         raise BatchValidationError(f"Source mismatch for ID {unit_id}")
     translation = item["translation"]
     if not isinstance(translation, str) or not translation.strip():
         raise BatchValidationError(f"Empty translation for ID {unit_id}")
-    if translation == item["source"] and _clearly_translatable(item["source"]):
-        raise BatchValidationError(f"Translation is unchanged for clearly translatable ID {unit_id}")
-    return item
+    source = expected[unit_id]["source"]
+    return {
+        "id": unit_id,
+        "source": source,
+        "translation": translation,
+    }
 
 
 def validate_response(payload: dict[str, Any], expected_units: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -249,55 +254,119 @@ def translate_batches(
     units: list[dict[str, Any]], client: TranslationClient, model: str,
     batch_size: int = DEFAULT_BATCH_SIZE, max_retries: int = DEFAULT_MAX_RETRIES,
     dictionary: TranslationDictionary | None = None,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if batch_size < 1:
         raise TranslationError("batch_size must be at least 1")
+
     batches = [units[index:index + batch_size] for index in range(0, len(units), batch_size)]
     results: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+
     for batch_number, batch in enumerate(batches, start=1):
         ids = [unit["id"] for unit in batch]
         print(f"Batch {batch_number}/{len(batches)}")
         print(f"IDs: {ids[0]}-{ids[-1]}")
+
         last_error: Exception | None = None
+
         for attempt in range(max_retries + 1):
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": _request_payload(batch)},
             ]
+
             if dictionary is not None:
-                messages.insert(1, {"role": "system", "content": dictionary.context()})
+                messages.insert(
+                    1,
+                    {"role": "system", "content": dictionary.context()},
+                )
+
             if last_error is not None:
                 messages.append({
                     "role": "user",
                     "content": (
-                        "Correction for the previous response: return the source field exactly as provided "
-                        "in the input JSON. Do not normalize whitespace or punctuation. The previous response "
-                        f"failed validation: {last_error}. Re-emit the complete batch JSON."
+                        "Correction for the previous response: return the complete batch "
+                        "with exactly one translation object per input ID. "
+                        "Return only valid JSON matching the required schema. "
+                        f"Previous validation error: {last_error}"
                     ),
                 })
+
             try:
                 response = client.chat_completion(messages, model)
-                validated = validate_response(extract_json_response(response), batch)
-                if dictionary is not None:
-                    for item in validated:
+                payload = extract_json_response(response)
+                validated = validate_response(payload, batch)
+
+                batch_unchanged: list[dict[str, Any]] = []
+
+                for item in validated:
+                    source = item["source"]
+                    translation = item["translation"]
+
+                    if (
+                        translation.strip() == source.strip()
+                        and _clearly_translatable(source)
+                    ):
+                        warning = {
+                            "id": item["id"],
+                            "source": source,
+                            "translation": translation,
+                            "note": "Model returned the source text unchanged",
+                        }
+                        batch_unchanged.append(warning)
+                        warnings.append(warning)
+
+                    if dictionary is not None:
                         item["translation"], corrections = enforce_terminology(
-                            item["source"], item["translation"], dictionary
+                            source,
+                            translation,
+                            dictionary,
                         )
                         for correction in corrections:
-                            LOGGER.info("Unit %s terminology correction: %s", item["id"], correction)
+                            LOGGER.info(
+                                "Unit %s terminology correction: %s",
+                                item["id"],
+                                correction,
+                            )
+
                 results.extend(validated)
+
+                if batch_unchanged:
+                    print(
+                        "Warning: unchanged translations: "
+                        f"{[item['id'] for item in batch_unchanged]}"
+                    )
+                    for item in batch_unchanged:
+                        LOGGER.warning(
+                            "Unit %s returned unchanged: %s",
+                            item["id"],
+                            item["source"],
+                        )
+
                 print("Status: OK")
                 break
-            except (BatchValidationError, ValueError, TypeError) as error:
+
+            except (BatchValidationError, ValueError, TypeError, TranslationError) as error:
                 last_error = error
-                LOGGER.warning("Batch %s failed on attempt %s: %s", batch_number, attempt + 1, error)
-                LOGGER.debug("Batch %s response was: %s", batch_number, locals().get("response", "<no response>"))
+                LOGGER.warning(
+                    "Batch %s failed on attempt %s: %s",
+                    batch_number,
+                    attempt + 1,
+                    error,
+                )
+                LOGGER.debug(
+                    "Batch %s response was: %s",
+                    batch_number,
+                    locals().get("response", "<no response>"),
+                )
+
         else:
             raise TranslationError(
-                f"Batch {batch_number} failed after {max_retries + 1} attempts; IDs={ids}: {last_error}"
+                f"Batch {batch_number} failed after {max_retries + 1} attempts; "
+                f"IDs={ids}: {last_error}"
             ) from last_error
-    return validate_response({"translations": results}, units)
 
+    return validate_response({"translations": results}, units), warnings
 
 def save_translation(
     output_path: Path, extraction_path: Path, extraction_payload: dict[str, Any],
@@ -366,10 +435,26 @@ def run_translation(
     print(f"Batch size: {config.batch_size}")
     print(f"Batches: {(len(translatable) + config.batch_size - 1) // config.batch_size}")
     print(f"Model: {config.model}")
-    translations = translate_batches(
-        translatable, active_client, config.model, config.batch_size, config.max_retries, dictionary
+    translations, warnings = translate_batches(
+        translatable,
+        active_client,
+        config.model,
+        config.batch_size,
+        config.max_retries,
+        dictionary,
     )
     translations = skipped_results + translations
+
+    if warnings:
+        print("\nTranslation Warnings")
+        print("--------------------")
+        print(f"Unchanged translations: {len(warnings)}")
+        for warning in warnings:
+            print(f"- ID {warning['id']}: source returned unchanged")
+    else:
+        print("\nTranslation Warnings")
+        print("--------------------")
+        print("None")
     translations.sort(key=lambda item: item["id"])
     print("\nValidation\n----------")
     print(f"Expected translations: {len(units)}")
