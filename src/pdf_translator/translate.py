@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 load_dotenv()
 
 from .filters import should_translate
+from .dictionary import DEFAULT_DICTIONARY_PATH, TranslationDictionary
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_EXTRACTION_PATH = Path("artifacts/extraction/extraction.json")
@@ -116,7 +117,9 @@ def _nonnegative_environment_int(name: str, default: int) -> int:
     return parsed
 
 
-def load_translation_units(extraction_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def load_translation_units(
+    extraction_path: Path, dictionary: TranslationDictionary | None = None
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     try:
         payload = json.loads(extraction_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -126,6 +129,7 @@ def load_translation_units(extraction_path: Path) -> tuple[dict[str, Any], list[
         for page in payload.get("pages", [])
         for unit in page.get("units", [])
         if unit.get("translate") is True
+        or (dictionary is not None and dictionary.skip_matches(unit.get("source", "")))
     ]
     return payload, units
 
@@ -201,9 +205,50 @@ def _request_payload(units: list[dict[str, Any]]) -> str:
     return json.dumps(units, ensure_ascii=False, indent=2)
 
 
+def _plain_text(value: str) -> str:
+    value = re.sub(r"<br\s*/?>", "\n", value, flags=re.IGNORECASE)
+    value = re.sub(r"</?(?:b|i|strong|em)>|`", "", value, flags=re.IGNORECASE)
+    return value.replace("**", "").replace("*", "")
+
+
+def _replace_corresponding_phrase(text: str, source: str, term: str, replacement: str) -> str:
+    pattern = re.compile(rf"(?<!\w){re.escape(term)}(?!\w)", re.IGNORECASE)
+    if pattern.search(text):
+        return pattern.sub(replacement, text, count=1)
+    source_start = source.casefold().find(term.casefold())
+    source_ratio = source_start / max(len(source), 1)
+    words = list(re.finditer(r"\S+", text))
+    if not words:
+        return replacement
+    start_index = min(len(words) - 1, round(source_ratio * len(words)))
+    term_word_count = max(1, len(term.split()))
+    end_index = min(len(words), start_index + term_word_count)
+    start = words[start_index].start()
+    end = words[end_index - 1].end()
+    return text[:start] + replacement + text[end:]
+
+
+def enforce_terminology(source: str, translation: str, dictionary: TranslationDictionary) -> tuple[str, list[str]]:
+    result = _plain_text(translation)
+    corrections: list[str] = []
+    for term in dictionary.matching_terms(source, "fixed_translation"):
+        expected = dictionary.fixed_translation[term]
+        corrected = _replace_corresponding_phrase(result, source, term, expected)
+        if corrected != result:
+            corrections.append(f"{term} -> {expected}")
+            result = corrected
+    for term in dictionary.matching_terms(source, "keep_english"):
+        corrected = _replace_corresponding_phrase(result, source, term, term)
+        if corrected != result:
+            corrections.append(f"{term} -> KEEP_ENGLISH")
+            result = corrected
+    return result, corrections
+
+
 def translate_batches(
     units: list[dict[str, Any]], client: TranslationClient, model: str,
     batch_size: int = DEFAULT_BATCH_SIZE, max_retries: int = DEFAULT_MAX_RETRIES,
+    dictionary: TranslationDictionary | None = None,
 ) -> list[dict[str, Any]]:
     if batch_size < 1:
         raise TranslationError("batch_size must be at least 1")
@@ -219,6 +264,8 @@ def translate_batches(
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": _request_payload(batch)},
             ]
+            if dictionary is not None:
+                messages.insert(1, {"role": "system", "content": dictionary.context()})
             if last_error is not None:
                 messages.append({
                     "role": "user",
@@ -231,6 +278,13 @@ def translate_batches(
             try:
                 response = client.chat_completion(messages, model)
                 validated = validate_response(extract_json_response(response), batch)
+                if dictionary is not None:
+                    for item in validated:
+                        item["translation"], corrections = enforce_terminology(
+                            item["source"], item["translation"], dictionary
+                        )
+                        for correction in corrections:
+                            LOGGER.info("Unit %s terminology correction: %s", item["id"], correction)
                 results.extend(validated)
                 print("Status: OK")
                 break
@@ -288,17 +342,35 @@ def run_translation(
     output_path: Path = DEFAULT_OUTPUT_PATH,
     config: TranslationConfig | None = None,
     client: TranslationClient | None = None,
+    dictionary_path: Path = DEFAULT_DICTIONARY_PATH,
 ) -> Path:
     config = config or TranslationConfig.from_environment()
-    extraction_payload, units = load_translation_units(extraction_path)
+    dictionary = TranslationDictionary.load(dictionary_path)
+    extraction_payload, units = load_translation_units(extraction_path, dictionary)
+    skipped = [unit for unit in units if dictionary.skip_matches(unit["source"])]
+    translatable = [unit for unit in units if not dictionary.skip_matches(unit["source"])]
+    skipped_results = [
+        {"id": unit["id"], "source": unit["source"], "translation": unit["source"]}
+        for unit in skipped
+    ]
     active_client = client or OpenAITranslationClient(config.base_url, config.api_key)
     print("Translation\n-----------")
     print(f"Input: {extraction_path}")
-    print(f"Units to translate: {len(units)}")
+    print(f"Units to translate: {len(translatable)}")
+    print("\nTranslation Dictionary")
+    print("----------------------")
+    print(f"Skip translation terms: {len(dictionary.skip_translation)}")
+    print(f"Keep English terms: {len(dictionary.keep_english)}")
+    print(f"Fixed translations: {len(dictionary.fixed_translation)}")
+    print(f"Units skipped: {len(skipped)}")
     print(f"Batch size: {config.batch_size}")
-    print(f"Batches: {(len(units) + config.batch_size - 1) // config.batch_size}")
+    print(f"Batches: {(len(translatable) + config.batch_size - 1) // config.batch_size}")
     print(f"Model: {config.model}")
-    translations = translate_batches(units, active_client, config.model, config.batch_size, config.max_retries)
+    translations = translate_batches(
+        translatable, active_client, config.model, config.batch_size, config.max_retries, dictionary
+    )
+    translations = skipped_results + translations
+    translations.sort(key=lambda item: item["id"])
     print("\nValidation\n----------")
     print(f"Expected translations: {len(units)}")
     print(f"Returned translations: {len(translations)}")
@@ -312,9 +384,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Translate extracted PDF units using a local OpenAI-compatible model.")
     parser.add_argument("--input", type=Path, default=DEFAULT_EXTRACTION_PATH)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH)
+    parser.add_argument("--dictionary", type=Path, default=DEFAULT_DICTIONARY_PATH)
     args = parser.parse_args()
     try:
-        run_translation(args.input, args.output)
+        run_translation(args.input, args.output, dictionary_path=args.dictionary)
     except TranslationError as error:
         print(f"Translation failed: {error}", file=sys.stderr)
         return 2

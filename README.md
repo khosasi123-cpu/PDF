@@ -1,6 +1,6 @@
 # pdf-translator
 
-Phase 2 of an offline PDF translation pipeline. Phase 1.5 inspects what PyMuPDF extracts from a PDF and produces block-level text units plus geometry-aware table-cell units and a visual inspection preview. Phase 2 sends selected units to a local OpenAI-compatible Mistral server and writes validated translations. It does not render a translated PDF.
+Phase 3 MVP of an offline PDF translation pipeline. Phase 1.5 extracts block-level text and geometry-aware table-cell units. Phase 2 translates selected units through a local OpenAI-compatible Mistral server with dictionary controls. The renderer overlays validated translations onto a copy of the original PDF.
 
 ## Installation
 
@@ -22,20 +22,20 @@ Add `--debug-assignments` to log each text-to-cell assignment, including table/c
 
 ## Full pipeline
 
-Run these commands from the project root in PowerShell:
+Run the entire pipeline from the project root with one command:
 
 ```powershell
-# 1. Extract the PDF and generate extraction artifacts
 .\.venv\Scripts\python.exe -m pdf_translator.main data/input/test.pdf
-
-# 2. Translate extraction.json using the local Mistral/vLLM server
-.\.venv\Scripts\python.exe -m pdf_translator.translate
-
-# 3. Render translations onto a copy of the original PDF
-.\.venv\Scripts\python.exe -m pdf_translator.render data/input/test.pdf
 ```
 
-The final PDF is written to `artifacts/rendered/test_id.pdf`. The source PDF is not overwritten. Step 2 reads `.env` values such as `LLM_BASE_URL`, `OPENAI_API_KEY`, and `MODEL`; the local vLLM server must already be running before that step.
+This runs extraction, dictionary-aware translation, and rendering in order. It writes `extraction.json`, `preview.pdf`, `translation.json`, and the final `artifacts/rendered/test_id.pdf`. The source PDF is not overwritten. The local vLLM server must already be running before this command.
+
+Use the separate commands when rerunning only one stage:
+
+```powershell
+.\.venv\Scripts\python.exe -m pdf_translator.translate
+.\.venv\Scripts\python.exe -m pdf_translator.render data/input/test.pdf
+```
 
 ## Local translation
 
@@ -56,6 +56,26 @@ Run translation independently from extraction:
 ```
 
 It reads `artifacts/extraction/extraction.json`, sends only units with `translate: true`, validates every batch ID and exact source string, and writes `artifacts/translation/translation.json`. Extraction JSON remains read-only. No PDF rendering is performed in Phase 2.
+
+## Translation dictionary
+
+Edit [config/translation_dictionary.json](config/translation_dictionary.json) to control translation behavior without changing Python code:
+
+- `skip_translation`: exact source units copied unchanged and never sent to the LLM.
+- `keep_english`: phrases preserved in English while the surrounding sentence is translated.
+- `fixed_translation`: source phrases replaced deterministically with the configured Indonesian term after LLM output.
+
+The dictionary is validated for duplicate category conflicts. Longer phrases are matched before shorter phrases with word-boundary-aware matching. Run the same translation command again after editing the dictionary, then render as usual.
+
+## Rendering
+
+Render the validated translation without running extraction or translation again:
+
+```powershell
+.\.venv\Scripts\python.exe -m pdf_translator.render data/input/test.pdf
+```
+
+The output is `artifacts/rendered/test_id.pdf`. The renderer uses the original PDF as its base and does not call the LLM.
 
 The command writes `artifacts/extraction/extraction.json` and `artifacts/extraction/preview.pdf` without modifying the input PDF. The preview keeps the original content and overlays green rectangles for normal text units, blue rectangles for table-cell units, and red rectangles for skipped units, with unit IDs beside them.
 
@@ -84,11 +104,11 @@ Pages without extractable text are reported and processing continues. OCR is not
 
 ## Known limitations
 
-- No LLM translation yet.
+- Translation and rendering are MVP stages; no overflow reflow beyond font-size reduction is implemented.
 - No OCR.
 - No semantic sentence detection.
 - No semantic block merging outside detected table cells.
-- No PDF text replacement or final PDF rendering/translation yet.
+- Overlay rendering leaves the original text in the PDF content stream, while covering it visually with white rectangles.
 - Line-end hyphenation such as `config-` / `uration` is not normalized.
 - Table boundaries come from visible PDF geometry; ordinary block boundaries come directly from PyMuPDF.
 - Geometry detection favors false negatives and can miss tables with broken, unusually thick, or non-rectangular borders.

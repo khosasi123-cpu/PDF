@@ -1,0 +1,16 @@
+{
+  "skip_translation": [
+    "Copyright:",
+    "Responsibility:",
+    "MANUAL / AUTO"
+  ],
+  "keep_english": [
+    "EDMS",
+    "HUMS",
+    "MMS",
+    "FOSDAC SERVER"
+  ],
+  "fixed_translation": {
+    "Free entry field": "Kolom isian bebas"
+  }
+}

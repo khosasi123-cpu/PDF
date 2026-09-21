@@ -1,6 +1,7 @@
 PyMuPDF<2,>=1.28
 openai>=1.0
 python-dotenv>=1.0
+pydantic>=2
 
 [test]
 pytest>=8

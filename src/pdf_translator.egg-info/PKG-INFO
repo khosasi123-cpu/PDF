@@ -7,6 +7,7 @@ Description-Content-Type: text/markdown
 Requires-Dist: PyMuPDF<2,>=1.28
 Requires-Dist: openai>=1.0
 Requires-Dist: python-dotenv>=1.0
+Requires-Dist: pydantic>=2
 Provides-Extra: test
 Requires-Dist: pytest>=8; extra == "test"
 
@@ -32,6 +33,23 @@ On Linux, use `.venv/bin/python` instead.
 
 Add `--debug-assignments` to log each text-to-cell assignment, including table/cell coordinates, bboxes, and whether containment or overlap selected the cell.
 
+## Full pipeline
+
+Run these commands from the project root in PowerShell:
+
+```powershell
+# 1. Extract the PDF and generate extraction artifacts
+.\.venv\Scripts\python.exe -m pdf_translator.main data/input/test.pdf
+
+# 2. Translate extraction.json using the local Mistral/vLLM server
+.\.venv\Scripts\python.exe -m pdf_translator.translate
+
+# 3. Render translations onto a copy of the original PDF
+.\.venv\Scripts\python.exe -m pdf_translator.render data/input/test.pdf
+```
+
+The final PDF is written to `artifacts/rendered/test_id.pdf`. The source PDF is not overwritten. Step 2 reads `.env` values such as `LLM_BASE_URL`, `OPENAI_API_KEY`, and `MODEL`; the local vLLM server must already be running before that step.
+
 ## Local translation
 
 Install the OpenAI-compatible client with the project dependencies, then configure the local server in the environment:
@@ -51,6 +69,16 @@ Run translation independently from extraction:
 ```
 
 It reads `artifacts/extraction/extraction.json`, sends only units with `translate: true`, validates every batch ID and exact source string, and writes `artifacts/translation/translation.json`. Extraction JSON remains read-only. No PDF rendering is performed in Phase 2.
+
+## Translation dictionary
+
+Edit [config/translation_dictionary.json](config/translation_dictionary.json) to control translation behavior without changing Python code:
+
+- `skip_translation`: exact source units copied unchanged and never sent to the LLM.
+- `keep_english`: phrases preserved in English while the surrounding sentence is translated.
+- `fixed_translation`: source phrases replaced deterministically with the configured Indonesian term after LLM output.
+
+The dictionary is validated for duplicate category conflicts. Longer phrases are matched before shorter phrases with word-boundary-aware matching. Run the same translation command again after editing the dictionary, then render as usual.
 
 The command writes `artifacts/extraction/extraction.json` and `artifacts/extraction/preview.pdf` without modifying the input PDF. The preview keeps the original content and overlays green rectangles for normal text units, blue rectangles for table-cell units, and red rectangles for skipped units, with unit IDs beside them.
 
