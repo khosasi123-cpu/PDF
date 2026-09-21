@@ -4,3 +4,4 @@ __pycache__/
 *.py[cod]
 artifacts/extraction/*.json
 artifacts/extraction/*.pdf
+artifacts/translation/*.json

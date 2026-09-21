@@ -1,16 +1,18 @@
 Metadata-Version: 2.4
 Name: pdf-translator
 Version: 0.1.0
-Summary: Phase 1 block-level PDF extraction and visual preview pipeline
+Summary: Offline PDF extraction and validated local translation pipeline
 Requires-Python: >=3.11
 Description-Content-Type: text/markdown
 Requires-Dist: PyMuPDF<2,>=1.28
+Requires-Dist: openai>=1.0
+Requires-Dist: python-dotenv>=1.0
 Provides-Extra: test
 Requires-Dist: pytest>=8; extra == "test"
 
 # pdf-translator
 
-Phase 1 of an offline PDF translation pipeline. This phase inspects what PyMuPDF extracts from a PDF and produces block-level translation units plus a visual inspection preview. It does not call an LLM.
+Phase 2 of an offline PDF translation pipeline. Phase 1.5 inspects what PyMuPDF extracts from a PDF and produces block-level text units plus geometry-aware table-cell units and a visual inspection preview. Phase 2 sends selected units to a local OpenAI-compatible Mistral server and writes validated translations. It does not render a translated PDF.
 
 ## Installation
 
@@ -28,7 +30,29 @@ On Linux, use `.venv/bin/python` instead.
 .\.venv\Scripts\python.exe -m pdf_translator.main data/input/test.pdf
 ```
 
-The command writes `artifacts/extraction/extraction.json` and `artifacts/extraction/preview.pdf` without modifying the input PDF. The preview keeps the original content and overlays green rectangles for translatable units and red rectangles for skipped units, with unit IDs beside them.
+Add `--debug-assignments` to log each text-to-cell assignment, including table/cell coordinates, bboxes, and whether containment or overlap selected the cell.
+
+## Local translation
+
+Install the OpenAI-compatible client with the project dependencies, then configure the local server in the environment:
+
+```powershell
+$env:LLM_BASE_URL = "http://localhost:1234/v1"
+$env:OPENAI_API_KEY = "local-key"
+$env:MODEL = "your-local-mistral-model"
+$env:TRANSLATION_BATCH_SIZE = "20"
+$env:TRANSLATION_MAX_RETRIES = "2"
+```
+
+Run translation independently from extraction:
+
+```powershell
+.\.venv\Scripts\python.exe -m pdf_translator.translate
+```
+
+It reads `artifacts/extraction/extraction.json`, sends only units with `translate: true`, validates every batch ID and exact source string, and writes `artifacts/translation/translation.json`. Extraction JSON remains read-only. No PDF rendering is performed in Phase 2.
+
+The command writes `artifacts/extraction/extraction.json` and `artifacts/extraction/preview.pdf` without modifying the input PDF. The preview keeps the original content and overlays green rectangles for normal text units, blue rectangles for table-cell units, and red rectangles for skipped units, with unit IDs beside them.
 
 A smoke-test PDF can be generated with:
 
@@ -39,9 +63,9 @@ A smoke-test PDF can be generated with:
 
 ## Phase 1 design
 
-A translation unit is one PyMuPDF text block (`block["type"] == 0`) containing at least one non-whitespace span. Spans are used only as extraction and style components. Unit bounding boxes are the union of all meaningful span boxes. Representative font metadata comes from the span with the most non-whitespace characters. Pages and application-facing unit page numbers are 1-based; PyMuPDF indexes are 0-based internally.
+A normal text unit is one PyMuPDF text block (`block["type"] == 0`) containing at least one non-whitespace span. A table-cell unit is the text assigned to one cell in a confidently detected bordered table. Spans are used only as extraction and style components. Normal unit bounding boxes are the union of meaningful span boxes; table-cell bounding boxes are the detected cell interior with a small border inset. Representative font metadata comes from the span with the most non-whitespace characters. Pages and application-facing unit page numbers are 1-based; PyMuPDF indexes are 0-based internally.
 
-Text extraction uses `page.get_text("dict", sort=True)`. Sorting is deliberate: it asks PyMuPDF for stable reading order while retaining the native page -> block -> line -> span hierarchy. Text is reconstructed line by line, preserving line boundaries and adding a space only when span geometry indicates a gap. The JSON records PyMuPDF version, page dimensions, rotation, unit direction, color, line count, and the `translate` decision.
+Text extraction uses `page.get_text("dict", sort=True)`. Sorting is deliberate: it asks PyMuPDF for stable reading order while retaining the native page -> block -> line -> span hierarchy. Table detection uses only `page.get_drawings()` and repeated thin horizontal/vertical geometry. It requires multiple complete adjacent cells and otherwise falls back to normal block extraction. Lines from different PyMuPDF blocks are merged when they belong to the same cell; spans crossing a cell boundary remain normal text and increment the ambiguous-assignment count. Text is reconstructed line by line, preserving line boundaries and adding a space only when span geometry indicates a gap. The JSON records PyMuPDF version, page dimensions, rotation, unit type, direction, color, line count, and the `translate` decision.
 
 The filter is deterministic and conservative. It skips empty text, all-identifier content, and blocks where at least 80% of whitespace-delimited tokens contain identifier-like characters such as digits, underscores, slashes, backslashes, dashes, dots, or colons. Uppercase words are not filtered by themselves. Skipped units remain in the JSON with `translate: false`.
 
@@ -58,9 +82,10 @@ Pages without extractable text are reported and processing continues. OCR is not
 - No LLM translation yet.
 - No OCR.
 - No semantic sentence detection.
-- No block merging.
+- No semantic block merging outside detected table cells.
 - No PDF text replacement or final PDF rendering/translation yet.
 - Line-end hyphenation such as `config-` / `uration` is not normalized.
-- Block boundaries come directly from PyMuPDF.
+- Table boundaries come from visible PDF geometry; ordinary block boundaries come directly from PyMuPDF.
+- Geometry detection favors false negatives and can miss tables with broken, unusually thick, or non-rectangular borders.
 - A PDF does not explicitly encode sentence boundaries.
 - The smoke-test PDF is only a validation fixture and is not representative of production PDFs.

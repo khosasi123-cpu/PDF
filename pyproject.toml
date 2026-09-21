@@ -5,10 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pdf-translator"
 version = "0.1.0"
-description = "Phase 1 block-level PDF extraction and visual preview pipeline"
+description = "Offline PDF extraction and validated local translation pipeline"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["PyMuPDF>=1.28,<2"]
+dependencies = ["PyMuPDF>=1.28,<2", "openai>=1.0", "python-dotenv>=1.0"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]

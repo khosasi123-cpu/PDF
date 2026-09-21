@@ -1,6 +1,6 @@
 # pdf-translator
 
-Phase 1.5 of an offline PDF translation pipeline. This phase inspects what PyMuPDF extracts from a PDF and produces block-level text units plus geometry-aware table-cell units and a visual inspection preview. It does not call an LLM.
+Phase 2 of an offline PDF translation pipeline. Phase 1.5 inspects what PyMuPDF extracts from a PDF and produces block-level text units plus geometry-aware table-cell units and a visual inspection preview. Phase 2 sends selected units to a local OpenAI-compatible Mistral server and writes validated translations. It does not render a translated PDF.
 
 ## Installation
 
@@ -19,6 +19,43 @@ On Linux, use `.venv/bin/python` instead.
 ```
 
 Add `--debug-assignments` to log each text-to-cell assignment, including table/cell coordinates, bboxes, and whether containment or overlap selected the cell.
+
+## Full pipeline
+
+Run these commands from the project root in PowerShell:
+
+```powershell
+# 1. Extract the PDF and generate extraction artifacts
+.\.venv\Scripts\python.exe -m pdf_translator.main data/input/test.pdf
+
+# 2. Translate extraction.json using the local Mistral/vLLM server
+.\.venv\Scripts\python.exe -m pdf_translator.translate
+
+# 3. Render translations onto a copy of the original PDF
+.\.venv\Scripts\python.exe -m pdf_translator.render data/input/test.pdf
+```
+
+The final PDF is written to `artifacts/rendered/test_id.pdf`. The source PDF is not overwritten. Step 2 reads `.env` values such as `LLM_BASE_URL`, `OPENAI_API_KEY`, and `MODEL`; the local vLLM server must already be running before that step.
+
+## Local translation
+
+Install the OpenAI-compatible client with the project dependencies, then configure the local server in the environment:
+
+```powershell
+$env:LLM_BASE_URL = "http://localhost:1234/v1"
+$env:OPENAI_API_KEY = "local-key"
+$env:MODEL = "your-local-mistral-model"
+$env:TRANSLATION_BATCH_SIZE = "20"
+$env:TRANSLATION_MAX_RETRIES = "2"
+```
+
+Run translation independently from extraction:
+
+```powershell
+.\.venv\Scripts\python.exe -m pdf_translator.translate
+```
+
+It reads `artifacts/extraction/extraction.json`, sends only units with `translate: true`, validates every batch ID and exact source string, and writes `artifacts/translation/translation.json`. Extraction JSON remains read-only. No PDF rendering is performed in Phase 2.
 
 The command writes `artifacts/extraction/extraction.json` and `artifacts/extraction/preview.pdf` without modifying the input PDF. The preview keeps the original content and overlays green rectangles for normal text units, blue rectangles for table-cell units, and red rectangles for skipped units, with unit IDs beside them.
 
