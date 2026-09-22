@@ -64,3 +64,109 @@ def test_translation_markup_becomes_plain_text(tmp_path: Path):
     text = fitz.open(output_path)[0].get_text()
     assert "Halo" in text
     assert "semua" in text
+
+
+def test_multiline_table_cell_translation_is_rendered(tmp_path: Path):
+    pdf_path = tmp_path / "source.pdf"
+    document = fitz.open()
+    page = document.new_page(width=200, height=100)
+    page.insert_text((25, 35), "English One", fontsize=8)
+    document.save(pdf_path)
+    document.close()
+
+    source = "English One\nEnglish Two\nEnglish Three\n1"
+    extraction_path = tmp_path / "extraction.json"
+    extraction_path.write_text(json.dumps({
+        "pages": [{"page_number": 1, "units": [{
+            "id": 1, "unit_type": "table_cell", "source": source,
+            "bbox": [20, 20, 180, 38], "fontsize": 8, "flags": 0, "translate": True,
+        }]}],
+    }), encoding="utf-8")
+    translation_path = tmp_path / "translation.json"
+    translation_path.write_text(json.dumps({
+        "translations": [{
+            "id": 1, "source": source,
+            "translation": "Indonesian One\nIndonesian Two\nIndonesian Three\n1",
+        }],
+    }), encoding="utf-8")
+
+    output_path, stats = render_pdf(pdf_path, extraction_path, translation_path, tmp_path / "out.pdf")
+
+    assert stats.rendered_units == 1
+    assert not stats.warnings
+    assert "Indonesian One Indonesian Two Indonesian Three 1" in fitz.open(output_path)[0].get_text()
+
+
+def test_compact_borderless_structured_text_is_rendered(tmp_path: Path):
+    pdf_path = tmp_path / "source.pdf"
+    document = fitz.open()
+    page = document.new_page(width=300, height=100)
+    page.insert_text((20, 30), "English One", fontsize=8)
+    document.save(pdf_path)
+    document.close()
+
+    source = "English One\nEnglish Two\nEnglish Three"
+    extraction_path = tmp_path / "extraction.json"
+    extraction_path.write_text(json.dumps({
+        "pages": [{"page_number": 1, "units": [{
+            "id": 1, "unit_type": "text", "source": source,
+            "bbox": [20, 20, 280, 31], "fontsize": 8, "line_count": 3,
+            "flags": 0, "translate": True,
+        }]}],
+    }), encoding="utf-8")
+    translation_path = tmp_path / "translation.json"
+    translation_path.write_text(json.dumps({
+        "translations": [{
+            "id": 1, "source": source,
+            "translation": "Indonesian One\nIndonesian Two\nIndonesian Three",
+        }],
+    }), encoding="utf-8")
+
+    output_path, stats = render_pdf(pdf_path, extraction_path, translation_path, tmp_path / "out.pdf")
+
+    assert stats.rendered_units == 1
+    assert not stats.warnings
+    assert "Indonesian One Indonesian Two Indonesian Three" in fitz.open(output_path)[0].get_text()
+
+
+def test_borderless_structured_lines_keep_original_x_positions(tmp_path: Path):
+    pdf_path = tmp_path / "source.pdf"
+    document = fitz.open()
+    page = document.new_page(width=300, height=100)
+    for x, text in ((20, "One"), (100, "Two"), (180, "Three")):
+        page.insert_text((x, 30), text, fontsize=8)
+    document.save(pdf_path)
+    document.close()
+
+    source = "One\nTwo\nThree"
+    extraction_path = tmp_path / "extraction.json"
+    extraction_path.write_text(json.dumps({
+        "pages": [{"page_number": 1, "units": [{
+            "id": 1, "unit_type": "text", "source": source,
+            "bbox": [20, 20, 210, 32.5], "fontsize": 9, "line_count": 3,
+            "flags": 0, "translate": True,
+        }]}],
+    }), encoding="utf-8")
+    translation_path = tmp_path / "translation.json"
+    translation_path.write_text(json.dumps({
+        "translations": [{
+            "id": 1, "source": source,
+            "translation": "Satu\nDua\nTiga",
+        }],
+    }), encoding="utf-8")
+
+    output_path, stats = render_pdf(pdf_path, extraction_path, translation_path, tmp_path / "out.pdf")
+
+    spans = [
+        span
+        for block in fitz.open(output_path)[0].get_text("dict")["blocks"]
+        if block.get("type") == 0
+        for line in block.get("lines", [])
+        for span in line.get("spans", [])
+        if span["text"] in {"Satu", "Dua", "Tiga"}
+    ]
+    assert stats.rendered_units == 1
+    assert not stats.warnings
+    assert [(span["text"], round(span["bbox"][0])) for span in spans] == [
+        ("Satu", 20), ("Dua", 100), ("Tiga", 180)
+    ]

@@ -15,6 +15,7 @@ DEFAULT_EXTRACTION_PATH = Path("artifacts/extraction/extraction.json")
 DEFAULT_TRANSLATION_PATH = Path("artifacts/translation/translation.json")
 DEFAULT_OUTPUT_DIR = Path("artifacts/rendered")
 MIN_FONT_SIZE = 5.5
+STRUCTURED_MIN_FONT_SIZE = 4.5
 PADDING = 0.75
 CELL_BORDER_INSET = 1.5
 
@@ -94,18 +95,49 @@ def _cover_rect(unit: dict[str, Any], rect: fitz.Rect) -> fitz.Rect:
     )
 
 
+def _is_compact_structured_unit(unit: dict[str, Any], rect: fitz.Rect) -> bool:
+    if unit.get("unit_type") == "table_cell":
+        return True
+    line_count = unit.get("line_count")
+    fontsize = unit.get("fontsize")
+    return (
+        isinstance(line_count, int)
+        and line_count > 1
+        and isinstance(fontsize, (int, float))
+        and rect.height <= float(fontsize) * 1.5
+    )
+
+
+def _structured_span_rects(page: fitz.Page, rect: fitz.Rect) -> list[fitz.Rect]:
+    spans: list[fitz.Rect] = []
+    for block in page.get_text("dict").get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                bbox = span.get("bbox")
+                if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                    continue
+                span_rect = fitz.Rect(*(float(value) for value in bbox))
+                if span.get("text", "").strip() and rect.contains(span_rect):
+                    spans.append(span_rect)
+    return sorted(spans, key=lambda span: (round(span.y0, 1), span.x0))
+
+
 def fit_text_to_rect(
     page: fitz.Page,
     rect: fitz.Rect,
     text: str,
     fontsize: float,
     flags: int = 0,
+    minimum_size: float = MIN_FONT_SIZE,
 ) -> tuple[float, bool]:
     """Insert text at the largest size that fits, returning size and fit status."""
-    safe_size = max(float(fontsize), MIN_FONT_SIZE)
+    minimum_size = max(float(minimum_size), 1.0)
+    safe_size = max(float(fontsize), minimum_size)
     fontname = _font_name(flags)
     current_size = safe_size
-    while current_size >= MIN_FONT_SIZE:
+    while current_size >= minimum_size:
         result = page.insert_textbox(
             rect,
             text,
@@ -121,13 +153,13 @@ def fit_text_to_rect(
     page.insert_textbox(
         rect,
         text,
-        fontsize=MIN_FONT_SIZE,
+        fontsize=minimum_size,
         fontname=fontname,
         color=(0, 0, 0),
         align=0,
         overlay=True,
     )
-    return MIN_FONT_SIZE, False
+    return minimum_size, False
 
 
 def render_pdf(
@@ -172,6 +204,9 @@ def render_pdf(
                     stats.warnings.append(f"Unit {unit_id}: invalid bounding box")
                     continue
                 text = _plain_text(str(translation_item.get("translation", "")))
+                structured_text = text
+                if _is_compact_structured_unit(unit, rect):
+                    text = " ".join(text.splitlines())
                 if not text.strip():
                     stats.warnings.append(f"Unit {unit_id}: empty translation")
                     continue
@@ -180,14 +215,38 @@ def render_pdf(
                     stats.warnings.append(f"Unit {unit_id}: invalid cover rectangle")
                     continue
                 page.draw_rect(cover, color=(1, 1, 1), fill=(1, 1, 1), width=0, overlay=True)
-                text_rect = fitz.Rect(cover.x0 + PADDING, cover.y0 + PADDING, cover.x1 - PADDING, cover.y1 - PADDING)
-                _, fits = fit_text_to_rect(
-                    page,
-                    text_rect,
-                    text,
-                    float(unit.get("fontsize", 10.0)),
-                    int(unit.get("flags", 0)),
-                )
+                structured_lines = None
+                if unit.get("unit_type") != "table_cell" and _is_compact_structured_unit(unit, rect):
+                    span_rects = _structured_span_rects(page, rect)
+                    translated_lines = structured_text.splitlines()
+                    if len(span_rects) == len(translated_lines) and len(span_rects) > 1:
+                        structured_lines = zip(span_rects, translated_lines)
+                if structured_lines is not None:
+                    fits = True
+                    for span_rect, translated_line in structured_lines:
+                        _, line_fits = fit_text_to_rect(
+                            page,
+                            span_rect,
+                            translated_line,
+                            float(unit.get("fontsize", 10.0)),
+                            int(unit.get("flags", 0)),
+                            minimum_size=STRUCTURED_MIN_FONT_SIZE,
+                        )
+                        fits = fits and line_fits
+                else:
+                    text_rect = fitz.Rect(
+                        cover.x0 + PADDING,
+                        cover.y0 + PADDING,
+                        cover.x1 - PADDING,
+                        cover.y1 - PADDING,
+                    )
+                    _, fits = fit_text_to_rect(
+                        page,
+                        text_rect,
+                        text,
+                        float(unit.get("fontsize", 10.0)),
+                        int(unit.get("flags", 0)),
+                    )
                 if not fits:
                     stats.warnings.append(f"Unit {unit_id}: text overflow at minimum font size")
                 stats.rendered_units += 1
