@@ -16,6 +16,7 @@ DEFAULT_TRANSLATION_PATH = Path("artifacts/translation/translation.json")
 DEFAULT_OUTPUT_DIR = Path("artifacts/rendered")
 MIN_FONT_SIZE = 5.5
 STRUCTURED_MIN_FONT_SIZE = 4.5
+STRUCTURED_Y_TOLERANCE = 1.5
 PADDING = 0.75
 CELL_BORDER_INSET = 1.5
 
@@ -121,7 +122,14 @@ def _structured_span_rects(page: fitz.Page, rect: fitz.Rect) -> list[fitz.Rect]:
                 span_rect = fitz.Rect(*(float(value) for value in bbox))
                 if span.get("text", "").strip() and rect.contains(span_rect):
                     spans.append(span_rect)
-    return sorted(spans, key=lambda span: (round(span.y0, 1), span.x0))
+    spans.sort(key=lambda span: (round(span.y0, 1), span.x0))
+    available: list[fitz.Rect] = []
+    for index, span in enumerate(spans):
+        right = span.x1
+        if index + 1 < len(spans) and abs(spans[index + 1].y0 - span.y0) <= STRUCTURED_Y_TOLERANCE:
+            right = min(rect.x1, spans[index + 1].x0 - PADDING)
+        available.append(fitz.Rect(span.x0, rect.y0, max(span.x1, right), rect.y1))
+    return available
 
 
 def fit_text_to_rect(

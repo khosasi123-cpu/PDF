@@ -170,3 +170,47 @@ def test_borderless_structured_lines_keep_original_x_positions(tmp_path: Path):
     assert [(span["text"], round(span["bbox"][0])) for span in spans] == [
         ("Satu", 20), ("Dua", 100), ("Tiga", 180)
     ]
+    assert min(span["size"] for span in spans) >= 7.5
+
+
+def test_structured_translation_uses_space_before_next_column(tmp_path: Path):
+    pdf_path = tmp_path / "source.pdf"
+    document = fitz.open()
+    page = document.new_page(width=300, height=100)
+    for x, text in ((20, "GROUND POWER UNIT"), (210, "Code"), (280, "1")):
+        page.insert_text((x, 30), text, fontsize=8)
+    document.save(pdf_path)
+    document.close()
+
+    source = "GROUND POWER UNIT\nCode\n1"
+    extraction_path = tmp_path / "extraction.json"
+    extraction_path.write_text(json.dumps({
+        "pages": [{"page_number": 1, "units": [{
+            "id": 1, "unit_type": "text", "source": source,
+            "bbox": [20, 20, 295, 32.5], "fontsize": 8.5, "line_count": 3,
+            "flags": 0, "translate": True,
+        }]}],
+    }), encoding="utf-8")
+    translation_path = tmp_path / "translation.json"
+    translation_path.write_text(json.dumps({
+        "translations": [{
+            "id": 1, "source": source,
+            "translation": "UNIT DAYA DARAT UNTUK OPERASIONAL\nKode\n1",
+        }],
+    }), encoding="utf-8")
+
+    output_path, stats = render_pdf(pdf_path, extraction_path, translation_path, tmp_path / "out.pdf")
+    translated_spans = [
+        span
+        for block in fitz.open(output_path)[0].get_text("dict")["blocks"]
+        if block.get("type") == 0
+        for line in block.get("lines", [])
+        for span in line.get("spans", [])
+        if span["text"] == "UNIT DAYA DARAT UNTUK OPERASIONAL"
+    ]
+
+    assert stats.rendered_units == 1
+    assert not stats.warnings
+    assert len(translated_spans) == 1
+    assert translated_spans[0]["bbox"][0] == 20
+    assert translated_spans[0]["size"] >= 6.5
