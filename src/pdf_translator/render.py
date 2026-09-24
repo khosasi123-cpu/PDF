@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import logging
 import re
@@ -19,6 +20,9 @@ STRUCTURED_MIN_FONT_SIZE = 4.5
 STRUCTURED_Y_TOLERANCE = 1.5
 PADDING = 0.75
 CELL_BORDER_INSET = 1.5
+_SYMBOL_MAP = {
+    "\u25cf": "\u2022",
+}
 
 
 @dataclass
@@ -29,6 +33,13 @@ class RenderStats:
     rendered_units: int = 0
     missing_translations: int = 0
     warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _StructuredSpan:
+    source_rect: fitz.Rect
+    render_rect: fitz.Rect
+    origin: fitz.Point
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -52,7 +63,7 @@ def _plain_text(value: str) -> str:
     value = re.sub(r"<br\s*/?>", "\n", value, flags=re.IGNORECASE)
     value = re.sub(r"</?(?:b|i|strong|em)>", "", value, flags=re.IGNORECASE)
     value = value.replace("**", "").replace("*", "")
-    return value
+    return "".join(_SYMBOL_MAP.get(character, character) for character in value)
 
 
 def _font_name(flags: int) -> str:
@@ -109,8 +120,37 @@ def _is_compact_structured_unit(unit: dict[str, Any], rect: fitz.Rect) -> bool:
     )
 
 
-def _structured_span_rects(page: fitz.Page, rect: fitz.Rect) -> list[fitz.Rect]:
-    spans: list[fitz.Rect] = []
+def _available_right_edge(page: fitz.Page, source_rect: fitz.Rect) -> float:
+    right = page.rect.x1
+    for block in page.get_text("dict").get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                bbox = span.get("bbox")
+                if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                    continue
+                candidate = fitz.Rect(bbox)
+                if (
+                    candidate.x0 > source_rect.x1 + PADDING
+                    and candidate.y1 > source_rect.y0
+                    and candidate.y0 < source_rect.y1
+                ):
+                    right = min(right, candidate.x0 - PADDING)
+    for obstacle in _page_obstacle_rects(page):
+        if (
+            obstacle.x0 > source_rect.x1 + PADDING
+            and obstacle.y1 > source_rect.y0
+            and obstacle.y0 < source_rect.y1
+        ):
+            right = min(right, obstacle.x0 - PADDING)
+    return right
+
+
+def _structured_spans(
+    page: fitz.Page, rect: fitz.Rect, expand_last_column: bool = False
+) -> list[_StructuredSpan]:
+    source_spans: list[tuple[fitz.Rect, fitz.Point]] = []
     for block in page.get_text("dict").get("blocks", []):
         if block.get("type") != 0:
             continue
@@ -121,15 +161,209 @@ def _structured_span_rects(page: fitz.Page, rect: fitz.Rect) -> list[fitz.Rect]:
                     continue
                 span_rect = fitz.Rect(*(float(value) for value in bbox))
                 if span.get("text", "").strip() and rect.contains(span_rect):
-                    spans.append(span_rect)
-    spans.sort(key=lambda span: (round(span.y0, 1), span.x0))
-    available: list[fitz.Rect] = []
-    for index, span in enumerate(spans):
-        right = span.x1
-        if index + 1 < len(spans) and abs(spans[index + 1].y0 - span.y0) <= STRUCTURED_Y_TOLERANCE:
-            right = min(rect.x1, spans[index + 1].x0 - PADDING)
-        available.append(fitz.Rect(span.x0, rect.y0, max(span.x1, right), rect.y1))
-    return available
+                    origin = span.get("origin")
+                    point = (
+                        fitz.Point(float(origin[0]), float(origin[1]))
+                        if isinstance(origin, (list, tuple)) and len(origin) == 2
+                        else fitz.Point(span_rect.x0, span_rect.y1)
+                    )
+                    source_spans.append((span_rect, point))
+    source_spans.sort(key=lambda item: (item[0].y0, item[0].x0))
+    rows: list[list[tuple[fitz.Rect, fitz.Point]]] = []
+    for span in source_spans:
+        if rows and abs(span[0].y0 - rows[-1][0][0].y0) <= STRUCTURED_Y_TOLERANCE:
+            rows[-1].append(span)
+        else:
+            rows.append([span])
+    result: list[_StructuredSpan] = []
+    for row_index, row in enumerate(rows):
+        row.sort(key=lambda item: item[0].x0)
+        next_row_y = rows[row_index + 1][0][0].y0 if row_index + 1 < len(rows) else rect.y1
+        for index, (span_rect, origin) in enumerate(row):
+            if index + 1 < len(row):
+                right = row[index + 1][0].x0 - PADDING
+            elif expand_last_column:
+                right = _available_right_edge(page, span_rect)
+            else:
+                right = rect.x1
+            bottom = max(span_rect.y1, next_row_y - PADDING)
+            result.append(_StructuredSpan(
+                source_rect=span_rect,
+                render_rect=fitz.Rect(span_rect.x0, span_rect.y0, max(span_rect.x1, right), bottom),
+                origin=origin,
+            ))
+    return result
+
+
+def _structured_span_rects(page: fitz.Page, rect: fitz.Rect) -> list[fitz.Rect]:
+    return [span.render_rect for span in _structured_spans(page, rect)]
+
+
+def _has_multi_column_rows(span_rects: list[fitz.Rect]) -> bool:
+    rows: list[list[fitz.Rect]] = []
+    for span in span_rects:
+        if rows and abs(span.y0 - rows[-1][0].y0) <= STRUCTURED_Y_TOLERANCE:
+            rows[-1].append(span)
+        else:
+            rows.append([span])
+    return any(len(row) > 1 for row in rows)
+
+
+def _has_repeated_column_geometry(span_rects: list[fitz.Rect]) -> bool:
+    rows: list[list[fitz.Rect]] = []
+    for span in span_rects:
+        if rows and abs(span.y0 - rows[-1][0].y0) <= STRUCTURED_Y_TOLERANCE:
+            rows[-1].append(span)
+        else:
+            rows.append([span])
+    multi_column_rows = [
+        row for row in rows
+        if len(row) > 1
+        and max(
+            right.x0 - left.x0
+            for left, right in zip(row, row[1:])
+        ) >= max(span.height for span in row) * 3
+    ]
+    for index, row in enumerate(multi_column_rows):
+        for other in multi_column_rows[index + 1:]:
+            aligned = sum(
+                any(abs(span.x0 - candidate.x0) <= 12 for candidate in other)
+                for span in row
+            )
+            if aligned >= 2:
+                return True
+    return False
+
+
+def _page_obstacle_rects(page: fitz.Page) -> list[fitz.Rect]:
+    """Bboxes of raster images and vector drawings on the page. These must
+    be treated as occupied space: growing a text rect into 'empty' space
+    must never grow into an image, or the white cover we draw before
+    re-inserting text will blank the image out."""
+    obstacles: list[fitz.Rect] = []
+    try:
+        for image_info in page.get_image_info():
+            bbox = image_info.get("bbox")
+            if bbox:
+                obstacles.append(fitz.Rect(bbox))
+    except Exception:  # pragma: no cover - defensive, keep rendering going
+        LOGGER.debug("get_image_info failed on page %s", page.number, exc_info=True)
+    try:
+        for drawing in page.get_drawings():
+            rect = drawing.get("rect")
+            if rect:
+                obstacles.append(fitz.Rect(rect))
+    except Exception:  # pragma: no cover - defensive, keep rendering going
+        LOGGER.debug("get_drawings failed on page %s", page.number, exc_info=True)
+    return obstacles
+
+
+def _page_filled_rects(page: fitz.Page) -> list[tuple[fitz.Rect, tuple[float, ...]]]:
+    filled: list[tuple[fitz.Rect, tuple[float, ...]]] = []
+    try:
+        for drawing in page.get_drawings():
+            rect = drawing.get("rect")
+            color = drawing.get("fill")
+            if rect and color:
+                filled.append((fitz.Rect(rect), tuple(color)))
+    except Exception:  # pragma: no cover - defensive, keep rendering going
+        LOGGER.debug("get_drawings failed on page %s", page.number, exc_info=True)
+    return filled
+
+
+def _background_color(
+    rect: fitz.Rect, filled_rects: list[tuple[fitz.Rect, tuple[float, ...]]]
+) -> tuple[float, ...]:
+    center = fitz.Point((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
+    candidates = [
+        (filled.width * filled.height, color)
+        for filled, color in filled_rects
+        if filled.contains(center)
+    ]
+    return min(candidates, default=(0.0, (1.0, 1.0, 1.0)))[1]
+
+
+def _safe_expanded_rect(
+    rect: fitz.Rect,
+    page_rect: fitz.Rect,
+    other_rects: list[fitz.Rect],
+) -> fitz.Rect:
+    right = page_rect.x1
+    bottom = page_rect.y1
+    for other in other_rects:
+        if other == rect:
+            continue
+        if other.y1 > rect.y0 and other.y0 < rect.y1 and other.x0 > rect.x1:
+            right = min(right, other.x0 - PADDING)
+        if other.x1 > rect.x0 and other.x0 < rect.x1 and other.y0 > rect.y1:
+            bottom = min(bottom, other.y0 - PADDING)
+    return fitz.Rect(rect.x0, rect.y0, max(rect.x1, right), max(rect.y1, bottom))
+
+
+def _measure_fit(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    text: str,
+    fontsize: float,
+    fontname: str,
+    minimum_size: float,
+) -> float | None:
+    """Return the largest font size (down to minimum_size) at which `text`
+    fits in `rect`, or None if it doesn't fit even at minimum_size.
+    Uses an uncommitted Shape so measurement never adds hidden text to the
+    PDF text layer."""
+    minimum_size = max(float(minimum_size), 1.0)
+    current_size = max(float(fontsize), minimum_size)
+    while current_size >= minimum_size:
+        result = page.new_shape().insert_textbox(
+            rect,
+            text,
+            fontsize=current_size,
+            fontname=fontname,
+            color=(0, 0, 0),
+            align=0,
+        )
+        if result >= 0:
+            return current_size
+        current_size -= 0.5
+    return None
+
+
+def _draw_text(page: fitz.Page, rect: fitz.Rect, text: str, fontsize: float, fontname: str) -> None:
+    page.insert_textbox(
+        rect,
+        text,
+        fontsize=fontsize,
+        fontname=fontname,
+        color=(0, 0, 0),
+        align=0,
+        overlay=True,
+    )
+
+
+def _measure_structured_line(
+    text: str, width: float, fontsize: float, fontname: str, minimum_size: float
+) -> float | None:
+    current_size = max(float(fontsize), float(minimum_size), 1.0)
+    minimum_size = max(float(minimum_size), 1.0)
+    while current_size >= minimum_size:
+        if fitz.get_text_length(text, fontname=fontname, fontsize=current_size) <= width:
+            return current_size
+        current_size -= 0.5
+    return None
+
+
+def _draw_structured_line(
+    page: fitz.Page, span: _StructuredSpan, text: str, fontsize: float, fontname: str
+) -> None:
+    page.insert_text(
+        span.origin,
+        text,
+        fontsize=fontsize,
+        fontname=fontname,
+        color=(0, 0, 0),
+        overlay=True,
+    )
 
 
 def fit_text_to_rect(
@@ -140,34 +374,91 @@ def fit_text_to_rect(
     flags: int = 0,
     minimum_size: float = MIN_FONT_SIZE,
 ) -> tuple[float, bool]:
-    """Insert text at the largest size that fits, returning size and fit status."""
-    minimum_size = max(float(minimum_size), 1.0)
-    safe_size = max(float(fontsize), minimum_size)
+    """Measure the best-fitting size for `text` in `rect`, then draw it
+    exactly once (at that size if it fits, otherwise at minimum_size)."""
     fontname = _font_name(flags)
-    current_size = safe_size
-    while current_size >= minimum_size:
-        result = page.insert_textbox(
-            rect,
-            text,
-            fontsize=current_size,
-            fontname=fontname,
-            color=(0, 0, 0),
-            align=0,
-            overlay=True,
-        )
-        if result >= 0:
-            return current_size, True
-        current_size -= 0.5
-    page.insert_textbox(
+    size = _measure_fit(page, rect, text, fontsize, fontname, minimum_size)
+    fits = size is not None
+    draw_size = size if fits else max(float(minimum_size), 1.0)
+    _draw_text(page, rect, text, draw_size, fontname)
+    return draw_size, fits
+
+
+def _insert_html_fallback(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    text: str,
+    fontsize: float,
+    flags: int,
+) -> bool:
+    escaped_lines = [
+        html.escape(line).replace("•", "<span style='font-family:Symbol'>•</span>")
+        for line in text.splitlines()
+    ]
+    lines = "<br>".join(escaped_lines)
+    weight = "bold" if flags & 16 else "normal"
+    style = f"font-family: Helvetica; font-size: {max(float(fontsize), MIN_FONT_SIZE)}pt; font-weight: {weight};"
+    spare_height, scale = page.insert_htmlbox(
         rect,
-        text,
-        fontsize=minimum_size,
-        fontname=fontname,
-        color=(0, 0, 0),
-        align=0,
+        f'<div style="{style}">{lines}</div>',
+        scale_low=0.25,
         overlay=True,
     )
-    return minimum_size, False
+    return spare_height >= 0 and scale > 0
+
+
+def _fit_text_with_fallbacks(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    text: str,
+    fontsize: float,
+    flags: int,
+    obstacle_rects: list[fitz.Rect],
+    minimum_size: float = MIN_FONT_SIZE,
+) -> bool:
+    """Try, in order: (1) the original rect, (2) the rect grown into
+    surrounding whitespace (never into another unit or an image), (3) an
+    HTML box as a last resort. Exactly one of these ends up drawing text,
+    so the unit is never rendered twice."""
+    fontname = _font_name(flags)
+
+    if "•" in text:
+        return _insert_html_fallback(page, rect, text, fontsize, flags)
+
+    size = _measure_fit(page, rect, text, fontsize, fontname, minimum_size)
+    if size is not None:
+        _draw_text(page, rect, text, size, fontname)
+        return True
+
+    expanded = _safe_expanded_rect(rect=rect, page_rect=page.rect, other_rects=obstacle_rects)
+    if expanded != rect:
+        size = _measure_fit(page, expanded, text, fontsize, fontname, minimum_size)
+        if size is not None:
+            page.draw_rect(expanded, color=(1, 1, 1), fill=(1, 1, 1), width=0, overlay=True)
+            _draw_text(page, expanded, text, size, fontname)
+            return True
+
+    # Last resort: HTML box with continuous scaling. Draw a white cover
+    # first (in case the expanded rect differs from the original cover)
+    # so this is the ONLY text object left in that area.
+    fallback_rect = expanded if expanded != rect else rect
+    page.draw_rect(fallback_rect, color=(1, 1, 1), fill=(1, 1, 1), width=0, overlay=True)
+    return _insert_html_fallback(page, fallback_rect, text, fontsize, flags)
+
+
+def _structured_mismatch_diagnostic(
+    unit: dict[str, Any], translation: str, spans: list[_StructuredSpan], rect: fitz.Rect,
+    fallback_rect: fitz.Rect | None,
+) -> str:
+    chosen = [] if fallback_rect is None else [tuple(fallback_rect)]
+    return (
+        f"Unit {unit.get('id')}: structured span mismatch; "
+        f"unit_type={unit.get('unit_type')!r}; source={unit.get('source')!r}; "
+        f"translation={translation!r}; span_count={len(spans)}; "
+        f"translated_line_count={len(translation.splitlines())}; "
+        f"source_span_bboxes={[tuple(span.source_rect) for span in spans]!r}; "
+        f"cell_bbox={tuple(rect)!r}; chosen_render_rects={chosen!r}"
+    )
 
 
 def render_pdf(
@@ -192,6 +483,16 @@ def render_pdf(
                 stats.warnings.append(f"Invalid page number for page entry: {page_number!r}")
                 continue
             page = document[page_number - 1]
+            unit_rects = [
+                candidate
+                for candidate in (_unit_rect(unit) for unit in page_data.get("units", []))
+                if candidate is not None
+            ]
+            # Images/drawings must never be covered by an "expand into
+            # empty space" attempt, so they are obstacles alongside other
+            # text units.
+            obstacle_rects = unit_rects + _page_obstacle_rects(page)
+            filled_rects = _page_filled_rects(page)
             for unit in page_data.get("units", []):
                 stats.total_units += 1
                 if unit.get("translate") is not True:
@@ -218,42 +519,122 @@ def render_pdf(
                 if not text.strip():
                     stats.warnings.append(f"Unit {unit_id}: empty translation")
                     continue
-                cover = _cover_rect(unit, rect)
-                if cover.width <= 0 or cover.height <= 0:
-                    stats.warnings.append(f"Unit {unit_id}: invalid cover rectangle")
-                    continue
-                page.draw_rect(cover, color=(1, 1, 1), fill=(1, 1, 1), width=0, overlay=True)
+                fontsize = float(unit.get("fontsize", 10.0))
+                flags = int(unit.get("flags", 0))
+
                 structured_lines = None
-                if unit.get("unit_type") != "table_cell" and _is_compact_structured_unit(unit, rect):
-                    span_rects = _structured_span_rects(page, rect)
+                structured_mismatch = False
+                structured_cell_fallback = False
+                fits = True
+                if unit.get("line_count", 0) > 1:
+                    structured_spans = _structured_spans(
+                        page, rect, expand_last_column=unit.get("unit_type") != "table_cell"
+                    )
+                    span_rects = [span.render_rect for span in structured_spans]
                     translated_lines = structured_text.splitlines()
-                    if len(span_rects) == len(translated_lines) and len(span_rects) > 1:
-                        structured_lines = zip(span_rects, translated_lines)
+                    is_table_cell = unit.get("unit_type") == "table_cell"
+                    has_multi_column_rows = _has_multi_column_rows(span_rects)
+                    is_structured = (
+                        is_table_cell
+                        or _is_compact_structured_unit(unit, rect)
+                        or has_multi_column_rows
+                    )
+                    has_geometry_match = (
+                        len(structured_spans) == len(translated_lines) and len(structured_spans) > 1
+                    )
+                    if has_geometry_match and is_structured:
+                        structured_lines = list(zip(structured_spans, translated_lines))
+                    elif (
+                        is_table_cell
+                        or _is_compact_structured_unit(unit, rect)
+                        or (
+                            len(structured_spans) == unit.get("line_count")
+                            and _has_repeated_column_geometry(span_rects)
+                        )
+                    ):
+                        structured_mismatch = True
+                        fallback_rect = None
+                        if is_table_cell:
+                            fallback_rect = fitz.Rect(
+                                rect.x0 + CELL_BORDER_INSET,
+                                rect.y0 + CELL_BORDER_INSET,
+                                rect.x1 - CELL_BORDER_INSET,
+                                rect.y1 - CELL_BORDER_INSET,
+                            )
+                            structured_cell_fallback = fallback_rect.width > 0 and fallback_rect.height > 0
+                        diagnostic = _structured_mismatch_diagnostic(
+                            unit, structured_text, structured_spans, rect,
+                            fallback_rect if structured_cell_fallback else None,
+                        )
+                        stats.warnings.append(diagnostic)
+                        LOGGER.warning(diagnostic)
+
                 if structured_lines is not None:
                     fits = True
-                    for span_rect, translated_line in structured_lines:
-                        _, line_fits = fit_text_to_rect(
-                            page,
-                            span_rect,
-                            translated_line,
-                            float(unit.get("fontsize", 10.0)),
-                            int(unit.get("flags", 0)),
-                            minimum_size=STRUCTURED_MIN_FONT_SIZE,
+                    fontname = _font_name(flags)
+                    for span, translated_line in structured_lines:
+                        source_cover = fitz.Rect(
+                            span.source_rect.x0 - 0.5,
+                            span.source_rect.y0,
+                            span.source_rect.x1 + 0.5,
+                            span.source_rect.y1,
                         )
-                        fits = fits and line_fits
-                else:
+                        source_color = _background_color(source_cover, filled_rects)
+                        page.draw_rect(
+                            source_cover, color=source_color, fill=source_color,
+                            width=0, overlay=True,
+                        )
+                        if "•" in translated_line:
+                            line_fits = _insert_html_fallback(
+                                page, span.render_rect, translated_line, fontsize, flags
+                            )
+                            fits = fits and line_fits
+                            continue
+                        size = _measure_structured_line(
+                            translated_line, span.render_rect.width, fontsize,
+                            fontname, STRUCTURED_MIN_FONT_SIZE,
+                        )
+                        if size is not None:
+                            _draw_structured_line(page, span, translated_line, size, fontname)
+                        else:
+                            line_fits = _insert_html_fallback(
+                                page, span.render_rect, translated_line, fontsize, flags
+                            )
+                            fits = fits and line_fits
+                elif structured_cell_fallback:
+                    cover = _cover_rect(unit, rect)
+                    cover_color = _background_color(cover, filled_rects)
+                    page.draw_rect(
+                        cover, color=cover_color, fill=cover_color, width=0, overlay=True
+                    )
                     text_rect = fitz.Rect(
                         cover.x0 + PADDING,
                         cover.y0 + PADDING,
                         cover.x1 - PADDING,
                         cover.y1 - PADDING,
                     )
-                    _, fits = fit_text_to_rect(
-                        page,
-                        text_rect,
-                        text,
-                        float(unit.get("fontsize", 10.0)),
-                        int(unit.get("flags", 0)),
+                    fontname = _font_name(flags)
+                    size = _measure_fit(page, text_rect, text, fontsize, fontname, STRUCTURED_MIN_FONT_SIZE)
+                    if size is not None:
+                        _draw_text(page, text_rect, text, size, fontname)
+                    else:
+                        fits = _insert_html_fallback(page, text_rect, text, fontsize, flags)
+                elif structured_mismatch:
+                    continue
+                else:
+                    cover = _cover_rect(unit, rect)
+                    if cover.width <= 0 or cover.height <= 0:
+                        stats.warnings.append(f"Unit {unit_id}: invalid cover rectangle")
+                        continue
+                    page.draw_rect(cover, color=(1, 1, 1), fill=(1, 1, 1), width=0, overlay=True)
+                    text_rect = fitz.Rect(
+                        cover.x0 + PADDING,
+                        cover.y0 + PADDING,
+                        cover.x1 - PADDING,
+                        cover.y1 - PADDING,
+                    )
+                    fits = _fit_text_with_fallbacks(
+                        page, text_rect, text, fontsize, flags, obstacle_rects, MIN_FONT_SIZE
                     )
                 if not fits:
                     stats.warnings.append(f"Unit {unit_id}: text overflow at minimum font size")

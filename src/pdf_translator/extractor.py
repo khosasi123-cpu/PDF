@@ -332,6 +332,60 @@ def _log_near_miss(block: dict[str, Any], page_number: int, regions: list[TableD
         )
 
 
+def _block_bbox(block: dict[str, Any]) -> tuple[float, float, float, float]:
+    return _union_bbox(_meaningful_spans(block))
+
+
+def _has_vertical_overlap(
+    left: list[dict[str, Any]], right: list[dict[str, Any]]
+) -> bool:
+    left_top = min(_block_bbox(block)[1] for block in left)
+    left_bottom = max(_block_bbox(block)[3] for block in left)
+    right_top = min(_block_bbox(block)[1] for block in right)
+    right_bottom = max(_block_bbox(block)[3] for block in right)
+    return min(left_bottom, right_bottom) > max(left_top, right_top)
+
+
+def _column_ordered_blocks(page: Any, blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Order genuine two-column segments left-to-right without moving
+    full-width separators into either column."""
+    page_width = float(page.rect.width)
+    midpoint = page_width / 2
+
+    def side(block: dict[str, Any]) -> str:
+        x0, _, x1, _ = _block_bbox(block)
+        if x1 <= midpoint:
+            return "left"
+        if x0 >= midpoint:
+            return "right"
+        return "wide"
+
+    left = [block for block in blocks if side(block) == "left"]
+    right = [block for block in blocks if side(block) == "right"]
+    if not left or not right or not _has_vertical_overlap(left, right):
+        return blocks
+
+    def order_segment(segment: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        segment_left = [block for block in segment if side(block) == "left"]
+        segment_right = [block for block in segment if side(block) == "right"]
+        if not segment_left or not segment_right or not _has_vertical_overlap(segment_left, segment_right):
+            return segment
+        position = lambda block: (_block_bbox(block)[1], _block_bbox(block)[0])
+        return sorted(segment_left, key=position) + sorted(segment_right, key=position)
+
+    ordered: list[dict[str, Any]] = []
+    segment: list[dict[str, Any]] = []
+    for block in sorted(blocks, key=lambda item: (_block_bbox(item)[1], _block_bbox(item)[0])):
+        if side(block) != "wide":
+            segment.append(block)
+            continue
+        ordered.extend(order_segment(segment))
+        segment = []
+        ordered.append(block)
+    ordered.extend(order_segment(segment))
+    return ordered
+
+
 def _cell_unit(
     lines: list[dict[str, Any]], cell: TableCell, page_number: int
 ) -> TranslationUnit | None:
@@ -375,7 +429,13 @@ def _extract_page_units_with_stats(
 ) -> tuple[list[TranslationUnit], int, int]:
     blocks = [block for block in page.get_text("dict", **EXTRACTION_OPTIONS).get("blocks", []) if block.get("type") == 0]
     regions = detect_table_regions(page)
+    if not regions and hasattr(page, "rect"):
+        blocks = _column_ordered_blocks(page, blocks)
     assigned: dict[TableCell, list[dict[str, Any]]] = {cell: [] for region in regions for cell in region.cells}
+
+    # Keep the selected page reading order while table spans are assigned.
+    ordered_items: list[tuple[str, TableCell | dict[str, Any]]] = []
+    seen_cells: set[TableCell] = set()
     normal_blocks: list[dict[str, Any]] = []
     ambiguous = 0
     for block in blocks:
@@ -407,24 +467,29 @@ def _extract_page_units_with_stats(
             # restore word spacing. A line split across cells is split into
             # cell-specific fragments and never merged across boundaries.
             for cell, cell_spans in spans_by_cell.items():
+                if cell not in seen_cells:
+                    seen_cells.add(cell)
+                    ordered_items.append(("cell", cell))
                 assigned[cell].append({"dir": line.get("dir"), "spans": cell_spans})
             if fallback_spans:
                 fallback_lines.append({"dir": line.get("dir"), "spans": fallback_spans})
         if fallback_lines:
-            normal_blocks.append({"type": 0, "lines": fallback_lines})
+            block_item = {"type": 0, "lines": fallback_lines}
+            normal_blocks.append(block_item)
+            ordered_items.append(("text", block_item))
         elif not assigned_spans:
             normal_blocks.append(block)
+            ordered_items.append(("text", block))
 
     units: list[TranslationUnit] = []
-    for cell, cell_lines in assigned.items():
-        unit = _cell_unit(cell_lines, cell, page_number)
+    for item_type, item in ordered_items:
+        if item_type == "cell":
+            cell = item
+            unit = _cell_unit(assigned[cell], cell, page_number)
+        else:
+            unit = block_to_unit(item, page_number, 0)
         if unit is not None:
             units.append(unit)
-    for block in normal_blocks:
-        unit = block_to_unit(block, page_number, 0)
-        if unit is not None:
-            units.append(unit)
-    units.sort(key=lambda unit: (unit.bbox[1], unit.bbox[0]))
     for unit_id, unit in enumerate(units, start=1):
         unit.id = unit_id
     return units, len(regions), ambiguous

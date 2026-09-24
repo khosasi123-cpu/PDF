@@ -64,6 +64,55 @@ def test_multiple_lines_and_bbox_union():
     assert unit.line_count == 2
 
 
+def test_page_units_preserve_pymupdf_block_order_instead_of_global_y_x_sort():
+    class MockPage:
+        def get_text(self, mode, **options):
+            return {"blocks": [
+                {"type": 0, "lines": [{"spans": [span("First column", [100, 20, 160, 30])]}]},
+                {"type": 0, "lines": [{"spans": [span("Second column", [10, 10, 80, 20])]}]},
+            ]}
+
+    units = extract_page_units(MockPage(), 1)
+
+    assert [unit.source for unit in units] == ["First column", "Second column"]
+
+
+def test_two_columns_are_ordered_left_to_right_then_top_to_bottom():
+    class MockPage:
+        rect = type("Rect", (), {"width": 600})()
+
+        def get_text(self, mode, **options):
+            return {"blocks": [
+                {"type": 0, "lines": [{"spans": [span("Right top", [310, 10, 380, 20])]}]},
+                {"type": 0, "lines": [{"spans": [span("Left top", [40, 30, 100, 40])]}]},
+                {"type": 0, "lines": [{"spans": [span("Right bottom", [310, 40, 390, 50])]}]},
+                {"type": 0, "lines": [{"spans": [span("Left bottom", [40, 50, 110, 60])]}]},
+            ]}
+
+    units = extract_page_units(MockPage(), 1)
+
+    assert [unit.source for unit in units] == [
+        "Left top", "Left bottom", "Right top", "Right bottom"
+    ]
+
+
+def test_wide_block_does_not_trigger_column_grouping():
+    class MockPage:
+        rect = type("Rect", (), {"width": 600})()
+
+        def get_text(self, mode, **options):
+            return {"blocks": [
+                {"type": 0, "lines": [{"spans": [span("Left", [40, 20, 100, 30])]}]},
+                {"type": 0, "lines": [{"spans": [span("Wide heading", [40, 40, 580, 50])]}]},
+                {"type": 0, "lines": [{"spans": [span("Right", [310, 20, 370, 30])]}]},
+                {"type": 0, "lines": [{"spans": [span("Left later", [40, 60, 110, 70])]}]},
+            ]}
+
+    units = extract_page_units(MockPage(), 1)
+
+    assert [unit.source for unit in units] == ["Left", "Right", "Wide heading", "Left later"]
+
+
 def test_representative_font_uses_non_whitespace_character_count():
     block = {
         "type": 0,

@@ -6,3 +6,4 @@ artifacts/extraction/*.json
 artifacts/extraction/*.pdf
 artifacts/translation/*.json
 /artifacts
+/data

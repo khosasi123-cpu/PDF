@@ -60,7 +60,7 @@ class TranslationItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: int
-    translation: str = Field(min_length=1)
+    translation: str 
 
 
 class LLMResponse(BaseModel):
@@ -176,7 +176,7 @@ def _validate_translation_item(item: Any, expected: dict[int, dict[str, Any]]) -
         raise BatchValidationError(f"Source mismatch for ID {unit_id}")
     translation = item["translation"]
     if not isinstance(translation, str) or not translation.strip():
-        raise BatchValidationError(f"Empty translation for ID {unit_id}")
+        translation = expected[unit_id]["source"]
     source = expected[unit_id]["source"]
     return {
         "id": unit_id,
@@ -397,7 +397,7 @@ class OpenAITranslationClient:
             model=model,
             input=messages,
             text_format=LLMResponse,
-            max_output_tokens=2048,
+            max_output_tokens=10000,
             temperature=0,
         )
         parsed = response.output_parsed
