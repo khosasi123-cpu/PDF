@@ -195,3 +195,27 @@ def test_instruction_owns_unit_sources_not_grouped_semantic_sources():
 
     assert instruction.source_ids == ["p0001/b0001"]
     assert instruction.semantic_source_ids == ["p0001/b0001", "p0001/b0002"]
+
+
+def test_neighboring_units_cannot_exchange_ownership_inside_one_semantic_region():
+    grouped = region(unit_ids=[1, 2], bbox=(10, 10, 190, 30), region_id="header")
+    grouped.source_ids = ["p0001/b0001", "p0001/b0002"]
+    left = unit(1, bbox=(10, 10, 70, 30))
+    left["source_ids"] = ["p0001/b0001"]
+    right = unit(2, bbox=(130, 10, 190, 30))
+    right["source_ids"] = ["p0001/b0002"]
+
+    result = RenderPlanner().plan(
+        plan(grouped),
+        {"units": [left, right]},
+        {**translation(1, "Kiri"), **translation(2, "Kanan")},
+        geometry(),
+    )
+
+    left_instruction = result.instruction_for_unit(1)
+    right_instruction = result.instruction_for_unit(2)
+    assert left_instruction.source_ids == ["p0001/b0001"]
+    assert right_instruction.source_ids == ["p0001/b0002"]
+    assert left_instruction.bbox == (10.0, 10.0, 70.0, 30.0)
+    assert right_instruction.bbox == (130.0, 10.0, 190.0, 30.0)
+    assert left_instruction.semantic_source_ids == right_instruction.semantic_source_ids

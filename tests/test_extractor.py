@@ -151,7 +151,9 @@ def test_extraction_json_is_valid(tmp_path: Path):
     assert payload["text_extraction_options"] == {"sort": True}
     assert payload["pages"][0]["page_number"] == 1
     assert payload["pages"][0]["units"][0]["translate"] is True
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
+    assert payload["artifact_type"] == "extraction"
+    assert len(payload["source_sha256"]) == 64
     assert payload["pages"][0]["source_objects"][0]["id"].startswith("p0001/")
 
 

@@ -2,15 +2,60 @@ import json
 from pathlib import Path
 
 import fitz
+import pytest
 
 from pdf_translator.layout import LayoutPlan
-from pdf_translator.render import _plain_text, render_pdf
+from pdf_translator.identity import payload_sha256, sha256_file
+from pdf_translator.render import _extracted_structured_spans, _plain_text, render_pdf
 
 
 def test_symbol_normalization_preserves_normal_text():
     assert _plain_text("● Test") == "• Test"
     assert _plain_text("○ • –") == "○ • –"
     assert _plain_text("Normal text") == "Normal text"
+
+
+def test_extracted_spans_keep_translation_unit_source_order(tmp_path: Path):
+    document = fitz.open()
+    page = document.new_page(width=200, height=100)
+    unit = {
+        "source_ids": ["title", "classification"],
+    }
+    page_data = {"source_objects": [
+        {"id": "classification", "kind": "span", "bbox": [140, 20, 190, 30]},
+        {"id": "title", "kind": "span", "bbox": [20, 35, 120, 50]},
+    ]}
+
+    spans = _extracted_structured_spans(
+        page, unit, page_data, fitz.Rect(20, 20, 190, 50)
+    )
+
+    assert [tuple(span.source_rect) for span in spans] == [
+        (20.0, 35.0, 120.0, 50.0),
+        (140.0, 20.0, 190.0, 30.0),
+    ]
+    document.close()
+
+
+def test_extracted_span_expansion_respects_column_right_limit():
+    document = fitz.open()
+    page = document.new_page(width=200, height=100)
+    unit = {"source_ids": ["left"]}
+    page_data = {"source_objects": [{
+        "id": "left", "kind": "span", "bbox": [20, 20, 60, 30],
+    }]}
+
+    spans = _extracted_structured_spans(
+        page,
+        unit,
+        page_data,
+        fitz.Rect(20, 20, 60, 30),
+        expand_last_column=True,
+        right_limit=99,
+    )
+
+    assert spans[0].render_rect.x1 == 99
+    document.close()
 
 
 def test_bullet_translation_uses_visible_unicode_without_question_mark(tmp_path: Path):
@@ -143,8 +188,15 @@ def test_table_cell_span_mismatch_uses_logged_logical_cell_fallback(tmp_path: Pa
         "translations": [{"id": 1, "source": source, "translation": "Terjemahan panjang"}],
     }), encoding="utf-8")
 
-    output_path, stats = render_pdf(pdf_path, extraction_path, translation_path, tmp_path / "out.pdf")
+    identity_dir = tmp_path / "identity"
+    output_path, stats = render_pdf(
+        pdf_path, extraction_path, translation_path, tmp_path / "out.pdf",
+        identity_debug_dir=identity_dir,
+    )
     warning = stats.warnings[0]
+    identity = json.loads(
+        (identity_dir / "render_identity.json").read_text(encoding="utf-8")
+    )["units"][0]
 
     assert stats.rendered_units == 1
     assert "Terjemahan panjang" in fitz.open(output_path)[0].get_text()
@@ -153,6 +205,11 @@ def test_table_cell_span_mismatch_uses_logged_logical_cell_fallback(tmp_path: Pa
         "translated_line_count=1", "source_span_bboxes=", "cell_bbox=",
         "chosen_render_rects=",
     ))
+    assert identity["render_status"] == "rendered"
+    assert identity["final_source_ids"] == identity["source_ids"]
+    x0, y0, x1, y1 = identity["final_bbox"]
+    assert 20 <= x0 < x1 <= 180
+    assert 20 <= y0 < y1 <= 60
 
 
 def test_multiline_fallback_translation_is_visible(tmp_path: Path):
@@ -462,6 +519,57 @@ def test_safe_expansion_covers_the_original_area_before_retry(tmp_path: Path):
     assert "Teks Indonesia yang sangat panjang dan membutuhkan ruang tambahan" in output_text
 
 
+def test_text_cover_does_not_erase_inline_vector_graphic(tmp_path: Path):
+    pdf_path = tmp_path / "source.pdf"
+    document = fitz.open()
+    page = document.new_page(width=200, height=80)
+    page.insert_text((20, 30), "Source", fontsize=9)
+    page.draw_rect(
+        fitz.Rect(70, 15, 90, 35), color=(1, 0, 0), fill=(1, 0, 0),
+    )
+    document.save(pdf_path)
+    document.close()
+    extraction_path = tmp_path / "extraction.json"
+    extraction_path.write_text(json.dumps({
+        "pages": [{
+            "page_number": 1,
+            "width": 200,
+            "height": 80,
+            "source_objects": [{
+                "id": "p0001/b0001/l0001/s0001",
+                "kind": "span",
+                "bbox": [20, 20, 50, 32],
+                "text": "Source",
+            }],
+            "units": [{
+                "id": 1,
+                "unit_type": "text",
+                "source": "Source",
+                "bbox": [20, 10, 120, 40],
+                "fontsize": 9,
+                "flags": 0,
+                "translate": True,
+                "source_ids": ["p0001/b0001/l0001/s0001"],
+            }],
+        }],
+    }), encoding="utf-8")
+    translation_path = tmp_path / "translation.json"
+    translation_path.write_text(json.dumps({
+        "translations": [{
+            "id": 1, "source": "Source", "translation": "Terjemahan",
+        }],
+    }), encoding="utf-8")
+
+    output_path, stats = render_pdf(
+        pdf_path, extraction_path, translation_path, tmp_path / "out.pdf"
+    )
+    pixmap = fitz.open(output_path)[0].get_pixmap(alpha=False)
+    pixel = pixmap.pixel(80, 25)
+
+    assert stats.rendered_units == 1
+    assert pixel[0] > 200 and pixel[1] < 50 and pixel[2] < 50
+
+
 def test_overflow_translation_uses_html_last_resort(tmp_path: Path):
     pdf_path = tmp_path / "source.pdf"
     document = fitz.open()
@@ -548,6 +656,12 @@ def test_render_plan_debug_artifacts_are_written(tmp_path: Path):
     )
     assert identity["units"][0]["translation_unit"] == 1
     assert identity["units"][0]["source_ids"] == identity["units"][0]["final_source_ids"]
+    assert identity["units"][0]["final_bbox"] == [15.0, 15.0, 55.0, 35.0]
+    assert identity["schema_version"] == 2
+    assert len(identity["source_sha256"]) == 64
+    assert len(identity["source_extraction_sha256"]) == 64
+    assert len(identity["source_translation_sha256"]) == 64
+    assert len(identity["output_sha256"]) == 64
     assert (debug_dir / "identity" / "source_page_001_overlay.png").exists()
     assert (debug_dir / "identity" / "output_page_001_overlay.png").exists()
 
@@ -558,9 +672,94 @@ def test_render_rejects_cross_document_artifacts(tmp_path: Path):
     extraction["source_file"] = "different.pdf"
     extraction_path.write_text(json.dumps(extraction), encoding="utf-8")
 
-    import pytest
-
     with pytest.raises(RuntimeError, match="Extraction source mismatch"):
+        render_pdf(pdf_path, extraction_path, translation_path, tmp_path / "out.pdf")
+
+
+def test_render_rejects_same_name_pdf_with_different_content(tmp_path: Path):
+    pdf_path, extraction_path, translation_path = _make_inputs(tmp_path)
+    extraction = json.loads(extraction_path.read_text(encoding="utf-8"))
+    extraction.update({
+        "schema_version": 3,
+        "artifact_type": "extraction",
+        "source_file": pdf_path.name,
+        "source_sha256": "0" * 64,
+    })
+    extraction_path.write_text(json.dumps(extraction), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="source hash mismatch"):
+        render_pdf(pdf_path, extraction_path, translation_path, tmp_path / "out.pdf")
+
+
+def test_render_rejects_translation_from_stale_extraction(tmp_path: Path):
+    pdf_path, extraction_path, translation_path = _make_inputs(tmp_path)
+    extraction = json.loads(extraction_path.read_text(encoding="utf-8"))
+    extraction.update({
+        "schema_version": 3,
+        "artifact_type": "extraction",
+        "source_file": pdf_path.name,
+        "source_sha256": sha256_file(pdf_path),
+    })
+    extraction_path.write_text(json.dumps(extraction), encoding="utf-8")
+    translation = json.loads(translation_path.read_text(encoding="utf-8"))
+    translation.update({
+        "schema_version": 2,
+        "artifact_type": "translation",
+        "source_file": pdf_path.name,
+        "source_sha256": sha256_file(pdf_path),
+        "source_extraction_sha256": "0" * 64,
+    })
+    translation_path.write_text(json.dumps(translation), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="extraction hash mismatch"):
+        render_pdf(pdf_path, extraction_path, translation_path, tmp_path / "out.pdf")
+
+
+def test_render_rejects_layout_plan_from_another_document(tmp_path: Path):
+    pdf_path, extraction_path, translation_path = _make_inputs(tmp_path)
+    extraction = json.loads(extraction_path.read_text(encoding="utf-8"))
+    extraction.update({
+        "schema_version": 3,
+        "artifact_type": "extraction",
+        "source_file": pdf_path.name,
+        "source_sha256": sha256_file(pdf_path),
+    })
+    extraction_path.write_text(json.dumps(extraction), encoding="utf-8")
+    translation = json.loads(translation_path.read_text(encoding="utf-8"))
+    translation.update({
+        "schema_version": 2,
+        "artifact_type": "translation",
+        "source_file": pdf_path.name,
+        "source_sha256": sha256_file(pdf_path),
+        "source_extraction_sha256": payload_sha256(extraction),
+    })
+    translation_path.write_text(json.dumps(translation), encoding="utf-8")
+    layout = LayoutPlan.model_validate({
+        "source_file": pdf_path.name,
+        "source_sha256": "f" * 64,
+        "source_extraction_sha256": payload_sha256(extraction),
+        "page_number": 1, "width": 200, "height": 100,
+        "regions": [{
+            "id": "r1", "type": "paragraph", "bbox": [15, 15, 55, 35],
+            "reading_order": 0, "confidence": 1,
+            "recommended_strategy": "reflow_region", "unit_ids": [1],
+        }],
+    })
+
+    with pytest.raises(RuntimeError, match="LayoutPlan page 1 source hash mismatch"):
+        render_pdf(
+            pdf_path, extraction_path, translation_path, tmp_path / "out.pdf",
+            layout_plans={1: layout},
+        )
+
+
+def test_render_rejects_duplicate_translation_ids(tmp_path: Path):
+    pdf_path, extraction_path, translation_path = _make_inputs(tmp_path)
+    translation = json.loads(translation_path.read_text(encoding="utf-8"))
+    translation["translations"].append(dict(translation["translations"][0]))
+    translation_path.write_text(json.dumps(translation), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Duplicate translation ID"):
         render_pdf(pdf_path, extraction_path, translation_path, tmp_path / "out.pdf")
 
 

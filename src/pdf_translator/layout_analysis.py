@@ -12,10 +12,14 @@ from dotenv import load_dotenv
 from pydantic import ValidationError
 
 from .layout import BBox, LayoutPlan, fallback_layout_plan, resolve_layout_plan_geometry
+from .identity import payload_sha256, sha256_file
 
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_CONFIDENCE_THRESHOLD = 0.6
+VISION_MAX_OUTPUT_TOKENS = 10000
+VISION_TEXT_HINT_LENGTH = 80
+DEFAULT_VISION_TIMEOUT_SECONDS = 300
 
 load_dotenv()
 
@@ -74,87 +78,95 @@ def compact_geometry(page_data: dict[str, Any], image_bboxes: list[BBox]) -> dic
         source.get("id"): source for source in page_data.get("source_objects", [])
         if isinstance(source.get("id"), str)
     }
-    selected_ids: set[str] = set()
     detailed_ids: set[str] = set()
-    selected_by_unit: dict[int, list[str]] = {}
+    compact_units: list[dict[str, Any]] = []
     for unit in page_data.get("units", []):
         source_ids = [source_id for source_id in unit.get("source_ids", []) if source_id in source_index]
-        detailed = unit.get("unit_type") in {"table_cell", "borderless_structured", "toc_entry"}
-        preferred_kinds = (
-            {"cell", "span"}
-            if detailed
-            else {"block"}
-        )
+        unit_type = unit.get("unit_type")
+        detailed = unit_type in {"table_cell", "borderless_structured"}
+        semantic_type = detailed or unit_type == "toc_entry"
+        preferred_kinds = {"cell", "span"} if semantic_type else {"block"}
         preferred = [
             source_id for source_id in source_ids
             if source_index[source_id].get("kind") in preferred_kinds
         ]
-        selected = preferred or [
-            source_id for source_id in source_ids
-            if source_index[source_id].get("kind") == "span"
-        ]
-        selected_ids.update(selected)
+        selected = preferred
+        if not selected:
+            selected = source_ids[:1]
         if detailed:
             detailed_ids.update(selected)
-        if isinstance(unit.get("id"), int):
-            selected_by_unit[unit["id"]] = selected
-    image_keys = {
-        tuple(round(float(value), 2) for value in bbox) for bbox in image_bboxes
-    }
-    seen_image_keys: set[tuple[float, ...]] = set()
-    for source_id, source in source_index.items():
-        if source.get("kind") != "image":
+        if not isinstance(unit.get("id"), int):
             continue
-        bbox = source.get("bbox")
-        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-            continue
-        key = tuple(round(float(value), 2) for value in bbox)
-        if key in image_keys and key not in seen_image_keys:
-            seen_image_keys.add(key)
-            selected_ids.add(source_id)
-            detailed_ids.add(source_id)
-    selected_sources = [source_index[source_id] for source_id in sorted(detailed_ids)]
-    return {
+        compact_unit: dict[str, Any] = {
+            "id": unit["id"],
+            "bbox": unit.get("bbox"),
+            "text": str(unit.get("source", ""))[:VISION_TEXT_HINT_LENGTH],
+            "source_ids": selected,
+        }
+        if semantic_type:
+            compact_unit["type"] = unit_type
+        compact_units.append(compact_unit)
+
+    geometry: dict[str, Any] = {
         "page_number": page_data.get("page_number"),
         "width": page_data.get("width"),
         "height": page_data.get("height"),
-        "units": [
-            {
-                "id": unit.get("id"),
-                "unit_type": unit.get("unit_type"),
-                "bbox": unit.get("bbox"),
-                "line_count": unit.get("line_count"),
-                "text": unit.get("source", "")[:160],
-                "source_ids": selected_by_unit.get(unit.get("id"), []),
-                "semantic_role": unit.get("semantic_role"),
-                "template_group_id": unit.get("template_group_id"),
-                "recurrence_count": unit.get("recurrence_count", 0),
-                "metadata": {
-                    key: value for key, value in unit.get("metadata", {}).items()
-                    if key in {
-                        "toc_page_number_bbox", "toc_hierarchy_level", "toc_column",
-                        "structured_column", "geometry_source",
-                    }
-                },
-            }
-            for unit in page_data.get("units", [])
-        ],
-        "source_objects": [
-            {
-                "id": source.get("id"),
-                "kind": source.get("kind"),
-                "bbox": source.get("bbox"),
-                "text": (
-                    str(source.get("text", ""))[:120]
-                    if source.get("kind") in {"span", "cell"} else ""
-                ),
-                "parent_id": source.get("parent_id"),
-            }
-            for source in selected_sources
-        ],
-        "toc_entries": page_data.get("toc_entries", []),
-        "images": [{"bbox": list(bbox)} for bbox in image_bboxes],
+        "units": compact_units,
     }
+    if detailed_ids:
+        detailed_sources: list[dict[str, Any]] = []
+        for source_id in sorted(detailed_ids):
+            source = source_index[source_id]
+            item: dict[str, Any] = {
+                "id": source_id,
+                "bbox": source.get("bbox"),
+            }
+            text = str(source.get("text", ""))[:VISION_TEXT_HINT_LENGTH]
+            if text:
+                item["text"] = text
+            detailed_sources.append(item)
+        geometry["source_objects"] = detailed_sources
+
+    toc_entries: list[dict[str, Any]] = []
+    for entry in page_data.get("toc_entries", []):
+        compact_entry = {
+            key: entry[key]
+            for key in (
+                "unit_id",
+                "title_source_ids",
+                "page_number_source_ids",
+                "title_bbox",
+                "page_number_bbox",
+                "hierarchy_level",
+                "column",
+            )
+            if entry.get(key) not in (None, [], {})
+        }
+        if compact_entry:
+            toc_entries.append(compact_entry)
+    if toc_entries:
+        geometry["toc_entries"] = toc_entries
+
+    if image_bboxes:
+        image_sources = [
+            source for source in source_index.values()
+            if source.get("kind") == "image"
+        ]
+        compact_images: list[dict[str, Any]] = []
+        for bbox in image_bboxes:
+            item: dict[str, Any] = {"bbox": list(bbox)}
+            key = tuple(round(float(value), 2) for value in bbox)
+            matching_source = next((
+                source for source in image_sources
+                if isinstance(source.get("bbox"), (list, tuple))
+                and len(source["bbox"]) == 4
+                and tuple(round(float(value), 2) for value in source["bbox"]) == key
+            ), None)
+            if matching_source is not None:
+                item["source_id"] = matching_source["id"]
+            compact_images.append(item)
+        geometry["images"] = compact_images
+    return geometry
 
 
 def analyze_page_layout(
@@ -187,7 +199,13 @@ def analyze_page_layout(
 
 
 class OpenAIMinistralVisionClient:
-    def __init__(self, base_url: str, api_key: str, model: str, timeout: float = 60.0):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout: float = DEFAULT_VISION_TIMEOUT_SECONDS,
+    ):
         from openai import OpenAI
 
         self.client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
@@ -199,14 +217,36 @@ class OpenAIMinistralVisionClient:
         base_url = (os.getenv("VISION_BASE_URL") or os.getenv("LLM_BASE_URL") or "").strip()
         if not model or not base_url:
             return None
-        return cls(base_url, os.getenv("OPENAI_API_KEY", "local-key"), model)
+        try:
+            timeout = float(os.getenv("VISION_TIMEOUT_SECONDS", DEFAULT_VISION_TIMEOUT_SECONDS))
+        except ValueError as error:
+            raise ValueError("VISION_TIMEOUT_SECONDS must be a number") from error
+        if timeout <= 0:
+            raise ValueError("VISION_TIMEOUT_SECONDS must be positive")
+        return cls(base_url, os.getenv("OPENAI_API_KEY", "local-key"), model, timeout)
 
     def analyze(self, page_png: bytes, geometry: dict[str, Any]) -> str:
         image_url = "data:image/png;base64," + base64.b64encode(page_png).decode("ascii")
+        geometry_json = json.dumps(geometry, ensure_ascii=False, separators=(",", ":"))
+        image_width = image_height = 0
+        if len(page_png) >= 24 and page_png[:8] == b"\x89PNG\r\n\x1a\n":
+            image_width = int.from_bytes(page_png[16:20], "big")
+            image_height = int.from_bytes(page_png[20:24], "big")
+        LOGGER.info(
+            "Vision request: page=%s geometry_chars=%s units=%s "
+            "detailed_source_objects=%s image_size=%sx%s requested_output_tokens=%s",
+            geometry.get("page_number"),
+            len(geometry_json),
+            len(geometry.get("units", [])),
+            len(geometry.get("source_objects", [])),
+            image_width,
+            image_height,
+            VISION_MAX_OUTPUT_TOKENS,
+        )
         response = self.client.chat.completions.create(
             model=self.model,
             temperature=0,
-            max_tokens=4000,
+            max_tokens=VISION_MAX_OUTPUT_TOKENS,
             response_format={
                 "type": "json_schema",
                 "json_schema": {
@@ -220,13 +260,18 @@ class OpenAIMinistralVisionClient:
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": json.dumps(geometry, ensure_ascii=False)},
+                        {"type": "text", "text": geometry_json},
                         {"type": "image_url", "image_url": {"url": image_url}},
                     ],
                 },
             ],
         )
-        content = response.choices[0].message.content
+        choice = response.choices[0]
+        if choice.finish_reason == "length":
+            raise RuntimeError(
+                f"vision response exceeded the {VISION_MAX_OUTPUT_TOKENS}-token output limit"
+            )
+        content = choice.message.content
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError("vision model returned no text")
         return content
@@ -257,6 +302,18 @@ def analyze_document_layout(
 ) -> dict[int, LayoutPlan]:
     from .render_debug import save_layout_debug
 
+    actual_source_sha256 = sha256_file(pdf_path)
+    if extraction.get("source_file") not in (None, pdf_path.name):
+        raise RuntimeError(
+            f"Extraction source mismatch: expected {pdf_path.name!r}, "
+            f"got {extraction.get('source_file')!r}"
+        )
+    if extraction.get("schema_version", 0) >= 3:
+        if extraction.get("source_sha256") != actual_source_sha256:
+            raise RuntimeError(
+                "Extraction source hash mismatch: artifact belongs to a different PDF"
+            )
+    extraction_sha256 = payload_sha256(extraction)
     output_dir.mkdir(parents=True, exist_ok=True)
     page_data_by_number = {
         page.get("page_number"): page for page in extraction.get("pages", [])
@@ -277,6 +334,9 @@ def analyze_document_layout(
             plan = analyze_page_layout(
                 page_data, page_png, images, client, confidence_threshold
             )
+            plan.source_file = pdf_path.name
+            plan.source_sha256 = actual_source_sha256
+            plan.source_extraction_sha256 = extraction_sha256
             plans[page_number] = plan
             stem = f"page_{page_number:03d}"
             (output_dir / f"{stem}.json").write_text(

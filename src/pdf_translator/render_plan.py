@@ -42,6 +42,12 @@ class RenderInstruction(BaseModel):
 class RenderPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    schema_version: int = 2
+    artifact_type: str = "render_plan"
+    source_file: str | None = None
+    source_sha256: str | None = None
+    source_extraction_sha256: str | None = None
+    source_translation_sha256: str | None = None
     page_number: int = Field(ge=1)
     width: float = Field(gt=0)
     height: float = Field(gt=0)
@@ -277,8 +283,6 @@ class RenderPlanner:
             instruction = self._plan_unit(
                 layout_plan, region, unit, translations.get(unit_id), page_geometry
             )
-            instruction.semantic_source_ids = list(instruction.source_ids)
-            instruction.source_ids = list(unit.get("source_ids", []))
             instructions.append(instruction)
             assigned.add(unit_id)
 
@@ -286,6 +290,10 @@ class RenderPlanner:
         if missing:
             warnings.append(f"Units without render instructions: {sorted(missing)}")
         return RenderPlan(
+            source_file=extraction.get("source_file"),
+            source_sha256=extraction.get("source_sha256"),
+            source_extraction_sha256=extraction.get("source_extraction_sha256"),
+            source_translation_sha256=extraction.get("source_translation_sha256"),
             page_number=layout_plan.page_number,
             width=layout_plan.width,
             height=layout_plan.height,
@@ -312,26 +320,26 @@ class RenderPlanner:
 
         if unit.get("unit_type") in {"table_cell", "borderless_structured"} or region.type in _STRUCTURED_TYPES:
             return self._instruction(
-                region, unit_id, RenderingStrategy.STRUCTURED_REGION, original, original,
+                region, unit, RenderingStrategy.STRUCTURED_REGION, original, original,
                 "structured PDF geometry takes priority over the model recommendation", fixed=True,
             )
 
         if unit.get("unit_type") == "toc_entry" or region.type == RegionType.TOC_ENTRY:
             return self._instruction(
-                region, unit_id, RenderingStrategy.TOC_REGION, original, original,
+                region, unit, RenderingStrategy.TOC_REGION, original, original,
                 "TOC title is rendered independently from its fixed page-number anchor", fixed=True,
             )
 
         spans = geometry.source_spans.get(unit_id, ())
         if _reliable_spans(spans, original, text):
             return self._instruction(
-                region, unit_id, RenderingStrategy.SOURCE_SPAN_MAPPING, original, original,
+                region, unit, RenderingStrategy.SOURCE_SPAN_MAPPING, original, original,
                 "translated lines match reliable source-span geometry", fixed=True,
             )
 
         if region.type == RegionType.MULTI_COLUMN:
             return self._instruction(
-                region, unit_id, RenderingStrategy.MULTICOLUMN_REGION, original, original,
+                region, unit, RenderingStrategy.MULTICOLUMN_REGION, original, original,
                 "region is an explicit multi-column leaf", fixed=True,
             )
 
@@ -348,18 +356,18 @@ class RenderPlanner:
             reason = "translation fits the source region with deterministic font fitting"
             if not recommendation_trusted:
                 reason += "; low-confidence recommendation ignored"
-            return self._instruction(region, unit_id, base, original, original, reason, fixed=base == RenderingStrategy.PRESERVE_REGION)
+            return self._instruction(region, unit, base, original, original, reason, fixed=base == RenderingStrategy.PRESERVE_REGION)
 
         if region.type in _FIXED_TYPES:
             return self._instruction(
-                region, unit_id, RenderingStrategy.FALLBACK_ORIGINAL_BBOX, original, original,
+                region, unit, RenderingStrategy.FALLBACK_ORIGINAL_BBOX, original, original,
                 "fixed header, footer, or TOC geometry cannot expand outside its source band",
                 fixed=True,
             )
 
         if any(_overlaps(original, image) for image in geometry.image_obstacles):
             return self._instruction(
-                region, unit_id, RenderingStrategy.FALLBACK_ORIGINAL_BBOX, original, original,
+                region, unit, RenderingStrategy.FALLBACK_ORIGINAL_BBOX, original, original,
                 "source text overlaps an image, so covering or expansion outside its bbox is unsafe",
                 fixed=True,
             )
@@ -372,12 +380,12 @@ class RenderPlanner:
         for candidate in candidates:
             if _fits(geometry, unit, candidate, text, minimum):
                 return self._instruction(
-                    region, unit_id, RenderingStrategy.EXPAND_REGION, original, candidate,
+                    region, unit, RenderingStrategy.EXPAND_REGION, original, candidate,
                     "translation overflows and a collision-free expansion fits", allow_expand=True,
                 )
 
         return self._instruction(
-            region, unit_id, RenderingStrategy.FALLBACK_ORIGINAL_BBOX, original, original,
+            region, unit, RenderingStrategy.FALLBACK_ORIGINAL_BBOX, original, original,
             "no collision-free expansion fits; renderer must use its safe original-bbox fallback",
             fixed=True,
         )
@@ -385,7 +393,7 @@ class RenderPlanner:
     @staticmethod
     def _instruction(
         region: LayoutRegion,
-        unit_id: int,
+        unit: dict[str, Any],
         strategy: RenderingStrategy,
         original: BBox,
         bbox: BBox,
@@ -393,6 +401,7 @@ class RenderPlanner:
         allow_expand: bool = False,
         fixed: bool = False,
     ) -> RenderInstruction:
+        unit_id = int(unit["id"])
         return RenderInstruction(
             id=f"{region.id}:unit-{unit_id}",
             region_id=region.id,
@@ -402,7 +411,8 @@ class RenderPlanner:
             bbox=bbox,
             allow_expand=allow_expand,
             source_geometry_fixed=fixed,
-            source_ids=region.source_ids,
+            source_ids=list(unit.get("source_ids", [])),
+            semantic_source_ids=list(region.source_ids),
             geometry_source=region.geometry_source,
             parent_region_id=region.parent_id,
             template_group_id=region.template_group_id,

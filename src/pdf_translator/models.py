@@ -87,6 +87,7 @@ class ExtractionResult:
     source_file: str
     pymupdf_version: str
     pages: list[PageExtraction]
+    source_sha256: str | None = None
     detected_tables: int = 0
     ambiguous_table_assignments: int = 0
 
@@ -96,9 +97,11 @@ class ExtractionResult:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
+            "artifact_type": "extraction",
             "source_id_scheme": "page-object-v1",
             "source_file": self.source_file,
+            "source_sha256": self.source_sha256,
             "pymupdf_version": self.pymupdf_version,
             "text_extraction_options": {"sort": True},
             "detected_tables": self.detected_tables,

@@ -74,6 +74,35 @@ def test_toc_entries_preserve_title_hierarchy_page_anchor_and_columns():
     assert all(entry.page_number_bbox[0] >= entry.title_bbox[2] for entry in result.pages[0].toc_entries)
 
 
+def test_toc_rows_embedded_in_single_spans_get_permanent_child_ownership():
+    units = []
+    sources = []
+    for index, y in enumerate((20, 35, 50, 65), start=1):
+        source_id = f"p0001/b{index:04d}/l0001/s0001"
+        text = f"Section {index} ........................ {index}"
+        source = SourceObject(
+            source_id, "span", (10, y, 190, y + 9), text,
+            parent_id=f"p0001/b{index:04d}/l0001", unit_ids=[index],
+            metadata={"fontsize": 9, "fontname": "Helvetica", "flags": 0},
+        )
+        sources.append(source)
+        units.append(make_unit(index, 1, text, source.bbox, [source_id]))
+    page = PageExtraction(1, 200, 100, 0, units, source_objects=sources)
+
+    result = analyze_document_semantics(ExtractionResult("doc.pdf", "test", [page]))
+    result_page = result.pages[0]
+
+    assert len(result_page.toc_entries) == 4
+    assert all(unit.unit_type == "toc_entry" for unit in result_page.units)
+    assert [unit.source for unit in result_page.units] == [
+        "Section 1", "Section 2", "Section 3", "Section 4"
+    ]
+    assert all(entry.page_number_source_ids[0].endswith("/toc-page") for entry in result_page.toc_entries)
+    assert all(entry.leader_source_ids[0].endswith("/toc-leader") for entry in result_page.toc_entries)
+    assert all(unit.source_ids[0].endswith("/toc-title") for unit in result_page.units)
+    assert all(source.kind == "toc_source" for source in sources[:4])
+
+
 def test_repeated_x_anchors_mark_borderless_key_value_rows_structured():
     units = []
     sources = []
@@ -93,3 +122,53 @@ def test_repeated_x_anchors_mark_borderless_key_value_rows_structured():
     assert all(unit.unit_type == "borderless_structured" for unit in result.pages[0].units)
     assert [round(unit.bbox[0]) for unit in result.pages[0].units] == [10, 100, 10, 100, 10, 100]
     assert all(unit.metadata["geometry_source"] == "inferred_borderless_grid" for unit in result.pages[0].units)
+
+
+def test_borderless_detection_preserves_spans_outside_anchor_sample():
+    units = []
+    sources = []
+    for index, y in enumerate((20, 50), start=1):
+        ids = [f"p0001/b{index:04d}/l{line:04d}/s0001" for line in range(1, 4)]
+        row_sources = [
+            SourceObject(ids[0], "span", (10, y, 40, y + 9), f"Key {index}", unit_ids=[index]),
+            SourceObject(ids[1], "span", (100, y, 150, y + 9), f"Value {index}", unit_ids=[index]),
+            SourceObject(ids[2], "span", (10, y + 12, 70, y + 21), f"Detail {index}", unit_ids=[index]),
+        ]
+        sources.extend(row_sources)
+        units.append(make_unit(
+            index, 1, "\n".join(source.text for source in row_sources),
+            (10, y, 150, y + 21), ids,
+        ))
+    page = PageExtraction(1, 200, 100, 0, units, source_objects=sources)
+
+    result = analyze_document_semantics(ExtractionResult("doc.pdf", "test", [page]))
+
+    structured = result.pages[0].units
+    assert len(structured) == 6
+    assert {unit.source_ids[0] for unit in structured} == {source.id for source in sources}
+
+
+def test_inline_parent_consumes_only_punctuation_linked_child_reference():
+    parent_id = "p0001/b0001/l0001/s0001"
+    reference_id = "p0001/b0002/l0001/s0001"
+    following_id = "p0001/b0002/l0002/s0001"
+    units = [
+        make_unit(1, 1, "Open the panel (", (10, 20, 80, 30), [parent_id]),
+        make_unit(
+            2, 1, "fig. 1: panel).\nContinue with the procedure (",
+            (82, 20, 190, 45), [reference_id, following_id],
+        ),
+    ]
+    sources = [
+        SourceObject(parent_id, "span", (10, 20, 80, 30), "Open the panel ("),
+        SourceObject(reference_id, "span", (82, 20, 130, 30), "fig. 1: panel)."),
+        SourceObject(following_id, "span", (10, 35, 150, 45), "Continue with the procedure ("),
+    ]
+    page = PageExtraction(1, 200, 100, 0, units, source_objects=sources)
+
+    result = analyze_document_semantics(ExtractionResult("doc.pdf", "test", [page]))
+
+    assert result.pages[0].units[0].source == "Open the panel (fig. 1: panel)."
+    assert result.pages[0].units[0].metadata["inline_child_source_ids"] == [reference_id]
+    assert result.pages[0].units[1].source == "Continue with the procedure ("
+    assert result.pages[0].units[1].source_ids == [following_id]

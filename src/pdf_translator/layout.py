@@ -106,6 +106,11 @@ class LayoutRegion(BaseModel):
 class LayoutPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    schema_version: int = 2
+    artifact_type: str = "layout_plan"
+    source_file: str | None = None
+    source_sha256: str | None = None
+    source_extraction_sha256: str | None = None
     page_number: int = Field(ge=1)
     width: float = Field(gt=0)
     height: float = Field(gt=0)

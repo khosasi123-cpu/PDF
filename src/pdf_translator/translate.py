@@ -18,12 +18,14 @@ load_dotenv()
 
 from .filters import should_translate
 from .dictionary import DEFAULT_DICTIONARY_PATH, TranslationDictionary
+from .identity import payload_sha256
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_EXTRACTION_PATH = Path("artifacts/extraction/extraction.json")
 DEFAULT_OUTPUT_PATH = Path("artifacts/translation/translation.json")
 DEFAULT_BATCH_SIZE = 20
 DEFAULT_MAX_RETRIES = 2
+MAX_OUTPUT_TOKENS = 10000
 
 SYSTEM_PROMPT = """You are a technical document translator.
 Translate English to professional technical Indonesian.
@@ -499,14 +501,20 @@ def save_translation(
     translations: list[dict[str, Any]], model: str,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    modern_identity = isinstance(extraction_payload.get("source_sha256"), str)
     output = {
+        "schema_version": 2 if modern_identity else 1,
+        "artifact_type": "translation",
         "source_file": extraction_payload.get("source_file", extraction_path.name),
         "source_extraction": str(extraction_path),
+        "source_extraction_sha256": payload_sha256(extraction_payload),
         "source_language": "English",
         "target_language": "Indonesian",
         "model": model,
         "translations": translations,
     }
+    if modern_identity:
+        output["source_sha256"] = extraction_payload["source_sha256"]
     output_path.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -523,7 +531,7 @@ class OpenAITranslationClient:
             model=model,
             input=messages,
             text_format=LLMResponse,
-            max_output_tokens=10000,
+            max_output_tokens=MAX_OUTPUT_TOKENS,
             temperature=0,
         )
         parsed = response.output_parsed

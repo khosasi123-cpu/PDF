@@ -6,6 +6,7 @@ import sys
 import fitz
 
 from .extractor import extract_pdf, save_extraction
+from .identity import sha256_file
 from .layout_analysis import OpenAIMinistralVisionClient, analyze_document_layout
 from .preview import create_preview
 from .render import print_summary, render_pdf
@@ -65,25 +66,33 @@ def main() -> int:
     parser.add_argument("pdf", type=Path, help="Input PDF path")
     parser.add_argument("--debug-assignments", action="store_true", help="Log text-to-table-cell assignments")
     parser.add_argument("--dictionary", type=Path, default=DEFAULT_DICTIONARY_PATH)
-    parser.add_argument("--extraction-output", type=Path, default=DEFAULT_EXTRACTION_PATH)
-    parser.add_argument("--translation-output", type=Path, default=DEFAULT_TRANSLATION_PATH)
+    parser.add_argument("--extraction-output", type=Path, default=None)
+    parser.add_argument("--translation-output", type=Path, default=None)
     parser.add_argument("--rendered-output", type=Path, default=None)
     parser.add_argument("--layout-output-dir", type=Path, default=None)
     args = parser.parse_args()
     pdf_path = args.pdf.resolve()
+    document_dir = (
+        Path("artifacts/documents")
+        / f"{pdf_path.stem}-{sha256_file(pdf_path)[:12]}"
+    )
+    extraction_output = args.extraction_output or document_dir / "extraction.json"
+    translation_output = args.translation_output or document_dir / "translation.json"
+    preview_output = document_dir / "preview.pdf"
+    rendered_output = args.rendered_output or document_dir / f"{pdf_path.stem}_id.pdf"
     if args.debug_assignments:
         logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(message)s")
     try:
         print("PHASE 1: Extraction")
         result = extract_pdf(pdf_path, debug_assignments=args.debug_assignments)
-        save_extraction(result, args.extraction_output)
-        create_preview(pdf_path, DEFAULT_PREVIEW_PATH, result)
+        save_extraction(result, extraction_output)
+        create_preview(pdf_path, preview_output, result)
         _print_summary(pdf_path, result)
-        print(f"Extraction JSON: {args.extraction_output}")
-        print(f"Preview PDF: {DEFAULT_PREVIEW_PATH}")
+        print(f"Extraction JSON: {extraction_output}")
+        print(f"Preview PDF: {preview_output}")
 
         print("\nPHASE 1.5: Adaptive layout analysis")
-        layout_output_dir = args.layout_output_dir or Path("artifacts/layout") / pdf_path.stem
+        layout_output_dir = args.layout_output_dir or document_dir / "layout"
         layout_plans = analyze_document_layout(
             pdf_path,
             result.to_dict(),
@@ -96,17 +105,17 @@ def main() -> int:
 
         print("\nPHASE 2: Translation")
         run_translation(
-            extraction_path=args.extraction_output,
-            output_path=args.translation_output,
+            extraction_path=extraction_output,
+            output_path=translation_output,
             dictionary_path=args.dictionary,
         )
 
         print("\nPHASE 3: Rendering")
         rendered_path, render_stats = render_pdf(
             pdf_path,
-            extraction_path=args.extraction_output,
-            translation_path=args.translation_output,
-            output_path=args.rendered_output,
+            extraction_path=extraction_output,
+            translation_path=translation_output,
+            output_path=rendered_output,
             layout_plans=layout_plans,
             render_plan_debug_dir=layout_output_dir,
             identity_debug_dir=layout_output_dir / "identity",

@@ -7,6 +7,7 @@ import logging
 import fitz
 
 from .filters import should_translate
+from .identity import sha256_file
 from .models import ExtractionResult, PageExtraction, SourceObject, TranslationUnit
 from .semantics import analyze_document_semantics
 
@@ -678,6 +679,7 @@ def extract_pdf(pdf_path: Path, debug_assignments: bool = False) -> ExtractionRe
         source_file=Path(pdf_path).name,
         pymupdf_version=str(getattr(fitz, "VersionBind", "unknown")),
         pages=pages,
+        source_sha256=sha256_file(pdf_path),
         detected_tables=detected_tables,
         ambiguous_table_assignments=ambiguous_assignments,
     ))

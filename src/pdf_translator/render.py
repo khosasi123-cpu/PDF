@@ -12,8 +12,16 @@ from typing import Any
 
 import fitz
 
-from .layout import LayoutPlan, RenderingStrategy, fallback_layout_plan, resolve_layout_plan_geometry
+from .layout import LayoutPlan, RegionType, RenderingStrategy, fallback_layout_plan, resolve_layout_plan_geometry
 from .render_plan import PageGeometry, RenderPlan, RenderPlanner
+from .identity import (
+    complete_identity_record,
+    identity_record,
+    payload_sha256,
+    validate_artifact_identity,
+    validate_layout_identity,
+    validate_source_ownership,
+)
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_EXTRACTION_PATH = Path("artifacts/extraction/extraction.json")
@@ -75,7 +83,9 @@ def _translation_map(payload: dict[str, Any]) -> dict[int, dict[str, Any]]:
     result: dict[int, dict[str, Any]] = {}
     for item in translations:
         unit_id = item.get("id")
-        if isinstance(unit_id, int) and unit_id not in result:
+        if isinstance(unit_id, int):
+            if unit_id in result:
+                raise RuntimeError(f"Duplicate translation ID: {unit_id}")
             result[unit_id] = item
     return result
 
@@ -120,6 +130,40 @@ def _unit_rect(unit: dict[str, Any]) -> fitz.Rect | None:
     return rect
 
 
+def _owned_source_span_rects(
+    unit: dict[str, Any], page_data: dict[str, Any]
+) -> list[fitz.Rect]:
+    source_ids = set(unit.get("source_ids", []))
+    return [
+        fitz.Rect(source["bbox"])
+        for source in page_data.get("source_objects", [])
+        if source.get("id") in source_ids
+        and source.get("kind") == "span"
+        and isinstance(source.get("bbox"), (list, tuple))
+        and len(source["bbox"]) == 4
+    ]
+
+
+def _source_origin(
+    unit: dict[str, Any], page_data: dict[str, Any], fallback: fitz.Point
+) -> fitz.Point:
+    source_ids = set(unit.get("source_ids", []))
+    for source in page_data.get("source_objects", []):
+        if source.get("id") not in source_ids or source.get("kind") != "span":
+            continue
+        origin = source.get("metadata", {}).get("origin")
+        if isinstance(origin, (list, tuple)) and len(origin) == 2:
+            return fitz.Point(float(origin[0]), float(origin[1]))
+    return fallback
+
+
+def _unit_color(unit: dict[str, Any]) -> tuple[float, float, float]:
+    color = unit.get("color")
+    if isinstance(color, int):
+        return fitz.sRGB_to_pdf(color)
+    return (0.0, 0.0, 0.0)
+
+
 def _cover_rect(unit: dict[str, Any], rect: fitz.Rect) -> fitz.Rect:
     if unit.get("unit_type") == "table_cell":
         return fitz.Rect(
@@ -149,8 +193,10 @@ def _is_compact_structured_unit(unit: dict[str, Any], rect: fitz.Rect) -> bool:
     )
 
 
-def _available_right_edge(page: fitz.Page, source_rect: fitz.Rect) -> float:
-    right = page.rect.x1
+def _available_right_edge(
+    page: fitz.Page, source_rect: fitz.Rect, right_limit: float | None = None
+) -> float:
+    right = min(page.rect.x1, right_limit) if right_limit is not None else page.rect.x1
     for block in page.get_text("dict").get("blocks", []):
         if block.get("type") != 0:
             continue
@@ -177,7 +223,10 @@ def _available_right_edge(page: fitz.Page, source_rect: fitz.Rect) -> float:
 
 
 def _structured_spans(
-    page: fitz.Page, rect: fitz.Rect, expand_last_column: bool = False
+    page: fitz.Page,
+    rect: fitz.Rect,
+    expand_last_column: bool = False,
+    right_limit: float | None = None,
 ) -> list[_StructuredSpan]:
     source_spans: list[tuple[fitz.Rect, fitz.Point]] = []
     for block in page.get_text("dict").get("blocks", []):
@@ -230,9 +279,14 @@ def _extracted_structured_spans(
     page_data: dict[str, Any],
     rect: fitz.Rect,
     expand_last_column: bool = False,
+    right_limit: float | None = None,
 ) -> list[_StructuredSpan]:
-    source_ids = set(unit.get("source_ids", []))
-    values: list[tuple[fitz.Rect, fitz.Point]] = []
+    ordered_source_ids = [
+        source_id for source_id in unit.get("source_ids", [])
+        if isinstance(source_id, str)
+    ]
+    source_ids = set(ordered_source_ids)
+    values: list[tuple[str, fitz.Rect, fitz.Point]] = []
     for source in page_data.get("source_objects", []):
         if source.get("id") not in source_ids or source.get("kind") != "span":
             continue
@@ -246,36 +300,36 @@ def _extracted_structured_spans(
             if isinstance(origin, (list, tuple)) and len(origin) == 2
             else fitz.Point(span_rect.x0, span_rect.y1)
         )
-        values.append((span_rect, point))
+        values.append((source["id"], span_rect, point))
     if not values:
-        return _structured_spans(page, rect, expand_last_column)
-    values.sort(key=lambda item: (item[0].y0, item[0].x0))
-    rows: list[list[tuple[fitz.Rect, fitz.Point]]] = []
+        return _structured_spans(page, rect, expand_last_column, right_limit)
+    values.sort(key=lambda item: (item[1].y0, item[1].x0))
+    rows: list[list[tuple[str, fitz.Rect, fitz.Point]]] = []
     for value in values:
-        if rows and abs(value[0].y0 - rows[-1][0][0].y0) <= STRUCTURED_Y_TOLERANCE:
+        if rows and abs(value[1].y0 - rows[-1][0][1].y0) <= STRUCTURED_Y_TOLERANCE:
             rows[-1].append(value)
         else:
             rows.append([value])
-    result: list[_StructuredSpan] = []
+    result_by_id: dict[str, _StructuredSpan] = {}
     for row_index, row in enumerate(rows):
-        row.sort(key=lambda item: item[0].x0)
-        next_y = rows[row_index + 1][0][0].y0 if row_index + 1 < len(rows) else rect.y1
-        for index, (span_rect, origin) in enumerate(row):
+        row.sort(key=lambda item: item[1].x0)
+        next_y = rows[row_index + 1][0][1].y0 if row_index + 1 < len(rows) else rect.y1
+        for index, (source_id, span_rect, origin) in enumerate(row):
             if index + 1 < len(row):
-                right = row[index + 1][0].x0 - PADDING
+                right = row[index + 1][1].x0 - PADDING
             elif expand_last_column:
-                right = _available_right_edge(page, span_rect)
+                right = _available_right_edge(page, span_rect, right_limit)
             else:
                 right = rect.x1
-            result.append(_StructuredSpan(
+            result_by_id[source_id] = _StructuredSpan(
                 source_rect=span_rect,
                 render_rect=fitz.Rect(
                     span_rect.x0, span_rect.y0, max(span_rect.x1, right),
                     max(span_rect.y1, next_y - PADDING),
                 ),
                 origin=origin,
-            ))
-    return result
+            )
+    return [result_by_id[source_id] for source_id in ordered_source_ids if source_id in result_by_id]
 
 
 def _structured_span_rects(page: fitz.Page, rect: fitz.Rect) -> list[fitz.Rect]:
@@ -552,11 +606,9 @@ def _fit_text_with_fallbacks(
             _draw_text(page, expanded, text, size, fontname)
             return True
 
-    # Last resort: HTML box with continuous scaling. Draw a white cover
-    # first (in case the expanded rect differs from the original cover)
-    # so this is the ONLY text object left in that area.
+    # The caller has already covered the owned source glyphs. Covering the
+    # whole allocation here would erase unrelated inline graphics or text.
     fallback_rect = expanded if expanded != rect else rect
-    page.draw_rect(fallback_rect, color=(1, 1, 1), fill=(1, 1, 1), width=0, overlay=True)
     return _insert_html_fallback(page, fallback_rect, text, fontsize, flags)
 
 
@@ -693,21 +745,10 @@ def render_pdf(
 ) -> tuple[Path, RenderStats]:
     extraction = _load_json(extraction_path)
     translation_payload = _load_json(translation_path)
-    extraction_source = extraction.get("source_file")
-    translation_source = translation_payload.get("source_file")
-    if isinstance(extraction_source, str) and extraction_source != pdf_path.name:
-        raise RuntimeError(
-            f"Extraction source mismatch: expected {pdf_path.name!r}, got {extraction_source!r}"
-        )
-    if (
-        isinstance(extraction_source, str)
-        and isinstance(translation_source, str)
-        and translation_source != extraction_source
-    ):
-        raise RuntimeError(
-            f"Translation source mismatch: extraction={extraction_source!r}, "
-            f"translation={translation_source!r}"
-        )
+    source_sha256, extraction_sha256 = validate_artifact_identity(
+        pdf_path, extraction, translation_payload
+    )
+    translation_sha256 = payload_sha256(translation_payload)
     translations = _translation_map(translation_payload)
     if output_path is None:
         output_path = DEFAULT_OUTPUT_DIR / f"{pdf_path.stem}_id.pdf"
@@ -727,6 +768,10 @@ def render_pdf(
                 **page_data,
                 "width": float(page_data.get("width", page.rect.width)),
                 "height": float(page_data.get("height", page.rect.height)),
+                "source_file": extraction.get("source_file", pdf_path.name),
+                "source_sha256": source_sha256,
+                "source_extraction_sha256": extraction_sha256,
+                "source_translation_sha256": translation_sha256,
             }
             unit_rects = [
                 candidate
@@ -737,13 +782,26 @@ def render_pdf(
             graphic_rects = _page_graphic_rects(page)
             obstacle_rects = unit_rects + image_rects + graphic_rects
             filled_rects = _page_filled_rects(page)
-            layout_plan = (
+            supplied_layout_plan = (
                 layout_plans.get(page_number)
                 if layout_plans is not None
                 else None
-            ) or fallback_layout_plan(
+            )
+            if supplied_layout_plan is not None and (
+                extraction.get("schema_version", 0) >= 3
+                or supplied_layout_plan.source_sha256 is not None
+                or supplied_layout_plan.source_extraction_sha256 is not None
+            ):
+                validate_layout_identity(
+                    supplied_layout_plan, source_sha256, extraction_sha256
+                )
+            layout_plan = supplied_layout_plan or fallback_layout_plan(
                 page_data, (_bbox_tuple(rect) for rect in image_rects)
             )
+            if supplied_layout_plan is None:
+                layout_plan.source_file = str(page_data["source_file"])
+                layout_plan.source_sha256 = source_sha256
+                layout_plan.source_extraction_sha256 = extraction_sha256
             layout_plan = resolve_layout_plan_geometry(layout_plan, page_data)
             render_plan = RenderPlanner().plan(
                 layout_plan,
@@ -764,61 +822,80 @@ def render_pdf(
             region_by_id = {region.id: region for region in layout_plan.regions}
             for unit in page_data.get("units", []):
                 stats.total_units += 1
-                if unit.get("translate") is not True:
-                    stats.skipped_units += 1
-                    continue
                 unit_id = unit.get("id")
-                translation_item = translations.get(unit_id)
-                if translation_item is None:
-                    stats.missing_translations += 1
-                    stats.warnings.append(f"Unit {unit_id}: missing translation")
-                    continue
-                if translation_item.get("source") != unit.get("source"):
-                    stats.warnings.append(f"Unit {unit_id}: translation source mismatch")
-                    continue
-                stats.translated_units += 1
                 rect = _unit_rect(unit)
+                instruction = render_plan.instruction_for_unit(unit_id)
                 if rect is None:
                     stats.warnings.append(f"Unit {unit_id}: invalid bounding box")
                     continue
+                if instruction is None:
+                    stats.warnings.append(f"Unit {unit_id}: no executable RenderPlan instruction")
+                    continue
+                validate_source_ownership(unit, instruction)
+                translation_item = translations.get(unit_id)
+                raw_translation = (
+                    str(translation_item.get("translation", ""))
+                    if translation_item is not None else None
+                )
+                identity = identity_record(
+                    page_number,
+                    unit,
+                    _plain_text(raw_translation) if raw_translation is not None else None,
+                    instruction,
+                    region_by_id.get(instruction.region_id),
+                )
+                stats.identity_records.append(identity)
+                source_text = str(unit.get("source", ""))
+                if unit.get("translate") is not True:
+                    stats.skipped_units += 1
+                    complete_identity_record(
+                        identity, [rect], source_text, "skipped", "unit is not translatable"
+                    )
+                    continue
+                if translation_item is None:
+                    stats.missing_translations += 1
+                    stats.warnings.append(f"Unit {unit_id}: missing translation")
+                    complete_identity_record(
+                        identity, [rect], source_text, "missing_translation",
+                        "translation artifact has no matching unit",
+                    )
+                    continue
+                if translation_item.get("source") != unit.get("source"):
+                    stats.warnings.append(f"Unit {unit_id}: translation source mismatch")
+                    complete_identity_record(
+                        identity, [rect], source_text, "source_mismatch",
+                        "translation source does not match extraction",
+                    )
+                    continue
+                stats.translated_units += 1
                 text = _plain_text(str(translation_item.get("translation", "")))
                 structured_text = text
                 if _is_compact_structured_unit(unit, rect):
                     text = " ".join(text.splitlines())
                 if not text.strip():
                     stats.warnings.append(f"Unit {unit_id}: empty translation")
+                    complete_identity_record(
+                        identity, [rect], source_text, "source_preserved", "empty translation"
+                    )
                     continue
                 fontsize = float(unit.get("fontsize", 10.0))
                 flags = int(unit.get("flags", 0))
-                instruction = render_plan.instruction_for_unit(unit_id)
-                if instruction is None:
-                    stats.warnings.append(f"Unit {unit_id}: no executable RenderPlan instruction")
-                    continue
-                from .identity import identity_record, validate_source_ownership
-
-                validate_source_ownership(unit, instruction)
-                identity = identity_record(
-                    page_number,
-                    unit,
-                    text,
-                    instruction,
-                    region_by_id.get(instruction.region_id),
-                )
-                stats.identity_records.append(identity)
-                source_text = str(unit.get("source", ""))
+                identity["translation"] = structured_text
                 if text == source_text:
-                    identity["render_status"] = "source_preserved"
-                    identity["final_rendered_text"] = source_text
-                    identity["fallback_reason"] = "translation equals source"
+                    complete_identity_record(
+                        identity, [rect], source_text, "source_preserved",
+                        "translation equals source",
+                    )
                     stats.rendered_units += 1
                     continue
                 if _has_private_use(source_text) or _has_private_use(text):
                     stats.warnings.append(
                         f"Unit {unit_id}: private-use glyph preserved with original visual content"
                     )
-                    identity["render_status"] = "source_preserved"
-                    identity["final_rendered_text"] = source_text
-                    identity["fallback_reason"] = "private-use glyph preserved"
+                    complete_identity_record(
+                        identity, [rect], source_text, "source_preserved",
+                        "private-use glyph preserved",
+                    )
                     stats.rendered_units += 1
                     continue
                 strategy = instruction.strategy
@@ -827,13 +904,29 @@ def render_pdf(
                 structured_mismatch = False
                 structured_cell_fallback = False
                 fits = True
+                rendered_rects: list[fitz.Rect] = []
+                rendered_text = text
+                span_right_limit = None
+                parent_region = region_by_id.get(instruction.parent_region_id)
+                if (
+                    parent_region is not None
+                    and parent_region.type == RegionType.MULTI_COLUMN
+                    and parent_region.bbox is not None
+                ):
+                    midpoint = (parent_region.bbox[0] + parent_region.bbox[2]) / 2
+                    span_right_limit = (
+                        midpoint - PADDING
+                        if (rect.x0 + rect.x1) / 2 <= midpoint
+                        else parent_region.bbox[2]
+                    )
                 if strategy in {
                     RenderingStrategy.STRUCTURED_REGION,
                     RenderingStrategy.SOURCE_SPAN_MAPPING,
                 } and unit.get("line_count", 0) > 1:
                     structured_spans = _extracted_structured_spans(
                         page, unit, page_data, rect,
-                        expand_last_column=unit.get("unit_type") != "table_cell"
+                        expand_last_column=unit.get("unit_type") != "table_cell",
+                        right_limit=span_right_limit,
                     )
                     span_rects = [span.render_rect for span in structured_spans]
                     translated_lines = structured_text.splitlines()
@@ -879,6 +972,8 @@ def render_pdf(
                         LOGGER.warning(diagnostic)
 
                 if structured_lines is not None:
+                    rendered_rects = [item[0].render_rect for item in structured_lines]
+                    rendered_text = structured_text
                     fits = primitives.render_source_spans(
                         [item[0] for item in structured_lines],
                         [item[1] for item in structured_lines],
@@ -894,6 +989,7 @@ def render_pdf(
                         cover.x1 - PADDING,
                         cover.y1 - PADDING,
                     )
+                    rendered_rects = [text_rect]
                     fontname = _font_name(flags)
                     size = _measure_fit(page, text_rect, text, fontsize, fontname, STRUCTURED_MIN_FONT_SIZE)
                     if size is not None:
@@ -904,8 +1000,10 @@ def render_pdf(
                     cover = _cover_rect(unit, rect)
                     if cover.width <= 0 or cover.height <= 0:
                         stats.warnings.append(f"Unit {unit_id}: invalid structured fallback rectangle")
-                        identity["render_status"] = "failed"
-                        identity["fallback_reason"] = "invalid structured fallback rectangle"
+                        complete_identity_record(
+                            identity, [], source_text, "failed",
+                            "invalid structured fallback rectangle",
+                        )
                         continue
                     primitives.cover(cover, background_aware=True)
                     text_rect = fitz.Rect(
@@ -914,6 +1012,7 @@ def render_pdf(
                         cover.x1 - PADDING,
                         cover.y1 - PADDING,
                     )
+                    rendered_rects = [text_rect]
                     fits = primitives.render_textbox(
                         text_rect, text, fontsize, flags, STRUCTURED_MIN_FONT_SIZE
                     )
@@ -921,8 +1020,24 @@ def render_pdf(
                     cover = _cover_rect(unit, rect)
                     if cover.width <= 0 or cover.height <= 0:
                         stats.warnings.append(f"Unit {unit_id}: invalid cover rectangle")
+                        complete_identity_record(
+                            identity, [], source_text, "failed", "invalid cover rectangle"
+                        )
                         continue
-                    primitives.cover(cover)
+                    source_covers = _owned_source_span_rects(unit, page_data)
+                    if source_covers:
+                        for source_cover in source_covers:
+                            primitives.cover(
+                                fitz.Rect(
+                                    source_cover.x0 - 0.5,
+                                    source_cover.y0,
+                                    source_cover.x1 + 0.5,
+                                    source_cover.y1,
+                                ),
+                                background_aware=True,
+                            )
+                    else:
+                        primitives.cover(cover, background_aware=True)
                     toc_anchor: tuple[float, float, float, float] | None = None
                     if strategy == RenderingStrategy.TOC_REGION:
                         anchor = instruction.page_number_anchor
@@ -941,10 +1056,8 @@ def render_pdf(
                                 rect.x0, rect.y0, max(rect.x1, anchor[0] - PADDING),
                                 max(rect.y1, min(next_top - PADDING, rect.y0 + rect.height * 2.2)),
                             )
-                            primitives.cover(text_rect, background_aware=True)
                     elif strategy == RenderingStrategy.EXPAND_REGION:
                         text_rect = fitz.Rect(instruction.bbox)
-                        primitives.cover(text_rect)
                     else:
                         text_rect = fitz.Rect(
                             cover.x0 + PADDING,
@@ -952,33 +1065,58 @@ def render_pdf(
                             cover.x1 - PADDING,
                             cover.y1 - PADDING,
                         )
-                    fits = primitives.render_textbox(
-                        text_rect, text, fontsize, flags, MIN_FONT_SIZE
-                    )
-                    if toc_anchor is not None:
-                        leader_end = toc_anchor[0] - PADDING
-                        leader_start = max(
-                            rect.x1 + PADDING,
-                            text_rect.x0 + text_rect.width * 0.72,
+                    direct_toc_size = None
+                    if strategy == RenderingStrategy.TOC_REGION and "\n" not in text:
+                        direct_toc_size = _measure_structured_line(
+                            text,
+                            text_rect.width,
+                            fontsize,
+                            _font_name(flags),
+                            MIN_FONT_SIZE,
                         )
-                        dot_size = max(MIN_FONT_SIZE, min(fontsize, 8.0))
-                        dot_width = max(fitz.get_text_length(".", fontname="helv", fontsize=dot_size), 1.0)
-                        count = int(max(0.0, leader_end - leader_start) / dot_width)
-                        if count >= 2:
-                            baseline = min(toc_anchor[3] - 1.0, text_rect.y1 - 1.0)
-                            page.insert_text(
-                                (leader_start, baseline), "." * count,
-                                fontsize=dot_size, fontname="helv", overlay=True,
-                            )
+                    if direct_toc_size is not None:
+                        origin = _source_origin(
+                            unit,
+                            page_data,
+                            fitz.Point(rect.x0, rect.y1 - 1.0),
+                        )
+                        page.insert_text(
+                            origin,
+                            text,
+                            fontsize=direct_toc_size,
+                            fontname=_font_name(flags),
+                            color=_unit_color(unit),
+                            overlay=True,
+                        )
+                        fits = True
+                        rendered_rects = [fitz.Rect(
+                            origin.x,
+                            origin.y - direct_toc_size,
+                            min(
+                                text_rect.x1,
+                                origin.x + fitz.get_text_length(
+                                    text, fontname=_font_name(flags), fontsize=direct_toc_size
+                                ),
+                            ),
+                            origin.y + direct_toc_size * 0.25,
+                        )]
+                    else:
+                        fits = primitives.render_textbox(
+                            text_rect, text, fontsize, flags, MIN_FONT_SIZE
+                        )
+                        rendered_rects = [text_rect]
                 if not fits:
                     stats.warnings.append(f"Unit {unit_id}: text overflow at minimum font size")
-                    identity["render_status"] = "rendered_overflow"
-                    identity["fallback_reason"] = "text overflow at minimum font size"
+                    status = "rendered_overflow"
+                    fallback_reason = "text overflow at minimum font size"
                 else:
-                    identity["render_status"] = "rendered"
-                identity["final_rendered_text"] = text
+                    status = "rendered"
+                    fallback_reason = None
                 if strategy == RenderingStrategy.FALLBACK_ORIGINAL_BBOX:
-                    identity["fallback_reason"] = instruction.reason
+                    fallback_reason = instruction.reason
+                complete_identity_record(
+                    identity, rendered_rects, rendered_text, status, fallback_reason
+                )
                 stats.rendered_units += 1
     finally:
         document.save(output_path, garbage=4, deflate=True)
@@ -996,7 +1134,14 @@ def render_pdf(
     if identity_debug_dir is not None:
         from .identity import save_identity_artifacts
 
-        save_identity_artifacts(pdf_path, output_path, stats.identity_records, identity_debug_dir)
+        save_identity_artifacts(
+            pdf_path,
+            output_path,
+            stats.identity_records,
+            identity_debug_dir,
+            extraction_path,
+            translation_path,
+        )
     return output_path, stats
 
 
