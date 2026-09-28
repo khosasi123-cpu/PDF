@@ -1,3 +1,3 @@
-"""Phase 1 block-level PDF extraction pipeline."""
+"""Adaptive offline PDF translation pipeline."""
 
 __version__ = "0.1.0"

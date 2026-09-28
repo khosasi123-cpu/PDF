@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,6 +75,14 @@ class TranslationDictionary:
             "- Translate the surrounding sentence naturally.",
         ])
         return "\n".join(lines)
+
+    def context_key(self) -> str:
+        payload = json.dumps({
+            "skip_translation": sorted(self.skip_translation),
+            "keep_english": sorted(self.keep_english),
+            "fixed_translation": dict(sorted(self.fixed_translation.items())),
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _terms(value: object, category: str) -> list[str]:

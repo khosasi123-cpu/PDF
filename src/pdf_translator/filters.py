@@ -14,5 +14,7 @@ def should_translate(text: str) -> bool:
     tokens = _TOKEN_PATTERN.findall(text.strip())
     if not tokens:
         return False
+    if not any(character.isalpha() for character in text):
+        return False
     identifier_count = sum(_is_identifier_token(token) for token in tokens)
     return identifier_count / len(tokens) < IDENTIFIER_RATIO_THRESHOLD

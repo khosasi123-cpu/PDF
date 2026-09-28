@@ -6,6 +6,7 @@ import sys
 import fitz
 
 from .extractor import extract_pdf, save_extraction
+from .layout_analysis import OpenAIMinistralVisionClient, analyze_document_layout
 from .preview import create_preview
 from .render import print_summary, render_pdf
 from .translate import (
@@ -67,6 +68,7 @@ def main() -> int:
     parser.add_argument("--extraction-output", type=Path, default=DEFAULT_EXTRACTION_PATH)
     parser.add_argument("--translation-output", type=Path, default=DEFAULT_TRANSLATION_PATH)
     parser.add_argument("--rendered-output", type=Path, default=None)
+    parser.add_argument("--layout-output-dir", type=Path, default=None)
     args = parser.parse_args()
     pdf_path = args.pdf.resolve()
     if args.debug_assignments:
@@ -79,6 +81,18 @@ def main() -> int:
         _print_summary(pdf_path, result)
         print(f"Extraction JSON: {args.extraction_output}")
         print(f"Preview PDF: {DEFAULT_PREVIEW_PATH}")
+
+        print("\nPHASE 1.5: Adaptive layout analysis")
+        layout_output_dir = args.layout_output_dir or Path("artifacts/layout") / pdf_path.stem
+        layout_plans = analyze_document_layout(
+            pdf_path,
+            result.to_dict(),
+            layout_output_dir,
+            client=OpenAIMinistralVisionClient.from_environment(),
+        )
+        vision_pages = sum(plan.source == "vision" for plan in layout_plans.values())
+        print(f"Layout plans: {layout_output_dir}")
+        print(f"Vision analyzed pages: {vision_pages}/{len(layout_plans)}")
 
         print("\nPHASE 2: Translation")
         run_translation(
@@ -93,6 +107,9 @@ def main() -> int:
             extraction_path=args.extraction_output,
             translation_path=args.translation_output,
             output_path=args.rendered_output,
+            layout_plans=layout_plans,
+            render_plan_debug_dir=layout_output_dir,
+            identity_debug_dir=layout_output_dir / "identity",
         )
         with fitz.open(pdf_path) as original:
             print_summary(pdf_path, rendered_path, original.page_count, render_stats)

@@ -1,4 +1,6 @@
-from dataclasses import asdict, dataclass
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
@@ -16,6 +18,11 @@ class TranslationUnit:
     direction: tuple[float, float] | None
     line_count: int
     translate: bool
+    source_ids: list[str] = field(default_factory=list)
+    semantic_role: str | None = None
+    template_group_id: str | None = None
+    recurrence_count: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -28,6 +35,8 @@ class PageExtraction:
     height: float
     rotation: int
     units: list[TranslationUnit]
+    source_objects: list[SourceObject] = field(default_factory=list)
+    toc_entries: list[TocEntry] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -36,7 +45,41 @@ class PageExtraction:
             "height": self.height,
             "rotation": self.rotation,
             "units": [unit.to_dict() for unit in self.units],
+            "source_objects": [source.to_dict() for source in self.source_objects],
+            "toc_entries": [entry.to_dict() for entry in self.toc_entries],
         }
+
+
+@dataclass
+class SourceObject:
+    id: str
+    kind: str
+    bbox: tuple[float, float, float, float]
+    text: str = ""
+    parent_id: str | None = None
+    unit_ids: list[int] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class TocEntry:
+    id: str
+    unit_id: int
+    title_source_ids: list[str]
+    page_number_source_ids: list[str]
+    leader_source_ids: list[str]
+    title_bbox: tuple[float, float, float, float]
+    page_number_bbox: tuple[float, float, float, float]
+    page_label: str
+    hierarchy_level: int
+    indentation: float
+    column: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass
@@ -53,6 +96,8 @@ class ExtractionResult:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "schema_version": 2,
+            "source_id_scheme": "page-object-v1",
             "source_file": self.source_file,
             "pymupdf_version": self.pymupdf_version,
             "text_extraction_options": {"sort": True},

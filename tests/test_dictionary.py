@@ -95,3 +95,14 @@ def test_context_excludes_skip_terms_and_includes_other_terms(tmp_path: Path):
     assert "Copyright:" not in context
     assert "EDMS" in context
     assert "Free entry field -> Kolom isian bebas" in context
+
+
+def test_dictionary_context_key_is_stable_and_content_sensitive(tmp_path: Path):
+    first = TranslationDictionary.load(write_dictionary(tmp_path, {
+        "skip_translation": ["A"], "keep_english": ["B"],
+        "fixed_translation": {"C": "D"},
+    }))
+    same = TranslationDictionary(("A",), ("B",), {"C": "D"})
+    changed = TranslationDictionary(("A",), ("B",), {"C": "E"})
+    assert first.context_key() == same.context_key()
+    assert first.context_key() != changed.context_key()

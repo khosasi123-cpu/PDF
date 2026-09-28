@@ -1,6 +1,6 @@
 # pdf-translator
 
-Phase 3 MVP of an offline PDF translation pipeline. Phase 1.5 extracts block-level text and geometry-aware table-cell units. Phase 2 translates selected units through a local OpenAI-compatible Mistral server with dictionary controls. The renderer overlays validated translations onto a copy of the original PDF.
+Offline PDF translation pipeline with PyMuPDF extraction, local model translation, advisory vision layout analysis, deterministic render planning, and PyMuPDF rendering.
 
 ## Installation
 
@@ -77,6 +77,20 @@ Render the validated translation without running extraction or translation again
 
 The output is `artifacts/rendered/test_id.pdf`. The renderer uses the original PDF as its base and does not call the LLM.
 
+## Adaptive layout planning
+
+The full pipeline writes validated LayoutPlans and RenderPlans to `artifacts/layout/<document>/`. Set `VISION_MODEL` and either `VISION_BASE_URL` or `LLM_BASE_URL` to enable local Ministral Vision analysis. If vision is unavailable, malformed, or low-confidence, extraction-based layout heuristics are used automatically.
+
+LayoutPlan recommendations are not drawing commands. `RenderPlanner` validates them against source spans, font fit, page and column bounds, neighboring text, images, and vector graphics. It then selects one of the small deterministic strategies: preserve, reflow, structured, multicolumn, preserve image, source-span mapping, safe expansion, or original-bbox fallback. PyMuPDF remains the only drawing implementation.
+
+Each page has a LayoutPlan JSON/debug PNG and a RenderPlan JSON/debug PNG. Image regions with embedded text are preserved and reported; text inside images is not translated yet.
+
+Extraction assigns deterministic page-local IDs to PDF blocks, lines, spans, images, and detected cells. Vision regions reference these IDs, and Python resolves their union from PyMuPDF geometry. Model bboxes are retained only for diagnostics when PDF-backed geometry exists; genuinely visual-only regions are marked `vision_estimate`.
+
+A document-level deterministic pass identifies repeated running headers/footers, source-separated TOC entries, and conservative borderless key/value grids. Headers and footers remain fixed to their source bands. TOC titles are translated independently while page-number anchors remain untouched and leader dots are regenerated deterministically.
+
+Translation validation separates structural failures from content sanitation. Empty output falls back to source, unchanged technical text is accepted, and obvious commentary, repeated sentences, extreme growth, or altered private-use glyphs receive one targeted retry before source fallback. Identical normalized source units of the same type reuse one translation within the current document run.
+
 The command writes `artifacts/extraction/extraction.json` and `artifacts/extraction/preview.pdf` without modifying the input PDF. The preview keeps the original content and overlays green rectangles for normal text units, blue rectangles for table-cell units, and red rectangles for skipped units, with unit IDs beside them.
 
 A smoke-test PDF can be generated with:
@@ -104,13 +118,14 @@ Pages without extractable text are reported and processing continues. OCR is not
 
 ## Known limitations
 
-- Translation and rendering are MVP stages; no overflow reflow beyond font-size reduction is implemented.
 - No OCR.
+- No image inpainting or replacement of text embedded in images.
 - No semantic sentence detection.
 - No semantic block merging outside detected table cells.
 - Overlay rendering leaves the original text in the PDF content stream, while covering it visually with white rectangles.
 - Line-end hyphenation such as `config-` / `uration` is not normalized.
 - Table boundaries come from visible PDF geometry; ordinary block boundaries come directly from PyMuPDF.
 - Geometry detection favors false negatives and can miss tables with broken, unusually thick, or non-rectangular borders.
+- Vision recommendations remain advisory and fall back to deterministic extraction geometry when unavailable or invalid.
 - A PDF does not explicitly encode sentence boundaries.
 - The smoke-test PDF is only a validation fixture and is not representative of production PDFs.

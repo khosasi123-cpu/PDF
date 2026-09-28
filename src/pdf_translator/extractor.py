@@ -7,7 +7,8 @@ import logging
 import fitz
 
 from .filters import should_translate
-from .models import ExtractionResult, PageExtraction, TranslationUnit
+from .models import ExtractionResult, PageExtraction, SourceObject, TranslationUnit
+from .semantics import analyze_document_semantics
 
 
 EXTRACTION_OPTIONS = {"sort": True}
@@ -44,6 +45,41 @@ def _meaningful_spans(block: dict[str, Any]) -> list[dict[str, Any]]:
         for span in line.get("spans", [])
         if span.get("text", "").strip()
     ]
+
+
+def _annotate_source_ids(blocks: list[dict[str, Any]], page_number: int) -> None:
+    prefix = f"p{page_number:04d}"
+    text_index = 0
+    image_index = 0
+    for block in blocks:
+        if block.get("type") == 0:
+            text_index += 1
+            block_id = f"{prefix}/b{text_index:04d}"
+            block["_source_id"] = block_id
+            for line_index, line in enumerate(block.get("lines", []), start=1):
+                line_id = f"{block_id}/l{line_index:04d}"
+                line["_source_id"] = line_id
+                for span_index, span in enumerate(line.get("spans", []), start=1):
+                    span["_source_id"] = f"{line_id}/s{span_index:04d}"
+        elif block.get("type") == 1:
+            image_index += 1
+            block["_source_id"] = f"{prefix}/i{image_index:04d}"
+
+
+def _source_ids(block: dict[str, Any]) -> list[str]:
+    result: list[str] = []
+    block_id = block.get("_source_id")
+    if isinstance(block_id, str):
+        result.append(block_id)
+    for line in block.get("lines", []):
+        line_id = line.get("_source_id")
+        if isinstance(line_id, str):
+            result.append(line_id)
+        result.extend(
+            span["_source_id"] for span in line.get("spans", [])
+            if span.get("text", "").strip() and isinstance(span.get("_source_id"), str)
+        )
+    return result
 
 
 def _reconstruct_line(line: dict[str, Any]) -> str:
@@ -113,6 +149,7 @@ def _unit_from_block(
         direction=_direction(block),
         line_count=sum(1 for line in block.get("lines", []) if _reconstruct_line(line)),
         translate=should_translate(source),
+        source_ids=_source_ids(block),
     )
 
 
@@ -387,7 +424,7 @@ def _column_ordered_blocks(page: Any, blocks: list[dict[str, Any]]) -> list[dict
 
 
 def _cell_unit(
-    lines: list[dict[str, Any]], cell: TableCell, page_number: int
+    lines: list[dict[str, Any]], cell: TableCell, page_number: int, cell_source_id: str
 ) -> TranslationUnit | None:
     spans = [span for line in lines for span in line.get("spans", []) if span.get("text", "").strip()]
     if not spans:
@@ -421,13 +458,95 @@ def _cell_unit(
         direction=_direction({"lines": lines}),
         line_count=len(lines),
         translate=should_translate(source),
+        source_ids=[
+            cell_source_id,
+            *[
+                span["_source_id"] for line in lines for span in line.get("spans", [])
+                if isinstance(span.get("_source_id"), str)
+            ],
+        ],
     )
+
+
+def _cell_source_id(
+    regions: list[TableDetection], cell: TableCell, page_number: int
+) -> str:
+    for table_index, region in enumerate(regions, start=1):
+        ordered = sorted(region.cells, key=lambda item: (item.bbox[1], item.bbox[0]))
+        if cell in ordered:
+            return f"p{page_number:04d}/t{table_index:04d}/c{ordered.index(cell) + 1:04d}"
+    raise ValueError("table cell is not part of a detected region")
+
+
+def _source_objects(
+    blocks: list[dict[str, Any]], regions: list[TableDetection], page_number: int
+) -> list[SourceObject]:
+    result: list[SourceObject] = []
+    for block in blocks:
+        source_id = block.get("_source_id")
+        if not isinstance(source_id, str):
+            continue
+        if block.get("type") == 0 and _meaningful_spans(block):
+            result.append(SourceObject(
+                id=source_id,
+                kind="block",
+                bbox=_union_bbox(_meaningful_spans(block)),
+                text=_reconstruct_block(block),
+            ))
+            for line in block.get("lines", []):
+                spans = [span for span in line.get("spans", []) if span.get("text", "").strip()]
+                if not spans:
+                    continue
+                line_id = line.get("_source_id")
+                if isinstance(line_id, str):
+                    result.append(SourceObject(
+                        id=line_id,
+                        kind="line",
+                        bbox=_union_bbox(spans),
+                        text=_reconstruct_line(line),
+                        parent_id=source_id,
+                    ))
+                for span in spans:
+                    span_id = span.get("_source_id")
+                    if isinstance(span_id, str):
+                        result.append(SourceObject(
+                            id=span_id,
+                            kind="span",
+                            bbox=tuple(float(value) for value in span["bbox"]),
+                            text=str(span.get("text", "")),
+                            parent_id=line_id if isinstance(line_id, str) else source_id,
+                            metadata={
+                                "fontsize": float(span.get("size", 0.0)),
+                                "flags": int(span.get("flags", 0)),
+                                "fontname": str(span.get("font", "")),
+                                "origin": list(span.get("origin", (span["bbox"][0], span["bbox"][3]))),
+                            },
+                        ))
+        elif block.get("type") == 1:
+            bbox = block.get("bbox")
+            if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                result.append(SourceObject(
+                    id=source_id,
+                    kind="image",
+                    bbox=tuple(float(value) for value in bbox),
+                ))
+    for region in regions:
+        for cell in sorted(region.cells, key=lambda item: (item.bbox[1], item.bbox[0])):
+            result.append(SourceObject(
+                id=_cell_source_id(regions, cell, page_number),
+                kind="cell",
+                bbox=cell.bbox,
+                metadata={"geometry_source": "detected_ruled_table"},
+            ))
+    return result
 
 
 def _extract_page_units_with_stats(
     page: Any, page_number: int, debug_assignments: bool = False
-) -> tuple[list[TranslationUnit], int, int]:
-    blocks = [block for block in page.get_text("dict", **EXTRACTION_OPTIONS).get("blocks", []) if block.get("type") == 0]
+) -> tuple[list[TranslationUnit], int, int, list[SourceObject]]:
+    all_blocks = page.get_text("dict", **EXTRACTION_OPTIONS).get("blocks", [])
+    _annotate_source_ids(all_blocks, page_number)
+    blocks = [block for block in all_blocks if block.get("type") == 0]
     regions = detect_table_regions(page)
     if not regions and hasattr(page, "rect"):
         blocks = _column_ordered_blocks(page, blocks)
@@ -485,20 +604,29 @@ def _extract_page_units_with_stats(
     for item_type, item in ordered_items:
         if item_type == "cell":
             cell = item
-            unit = _cell_unit(assigned[cell], cell, page_number)
+            unit = _cell_unit(
+                assigned[cell], cell, page_number,
+                _cell_source_id(regions, cell, page_number),
+            )
         else:
             unit = block_to_unit(item, page_number, 0)
         if unit is not None:
             units.append(unit)
     for unit_id, unit in enumerate(units, start=1):
         unit.id = unit_id
-    return units, len(regions), ambiguous
+    sources = _source_objects(all_blocks, regions, page_number)
+    source_index = {source.id: source for source in sources}
+    for unit in units:
+        for source_id in unit.source_ids:
+            if source_id in source_index and unit.id not in source_index[source_id].unit_ids:
+                source_index[source_id].unit_ids.append(unit.id)
+    return units, len(regions), ambiguous, sources
 
 
 def extract_page_units(
     page: Any, page_number: int, first_unit_id: int = 1, debug_assignments: bool = False
 ) -> list[TranslationUnit]:
-    units, _, _ = _extract_page_units_with_stats(page, page_number, debug_assignments)
+    units, _, _, _ = _extract_page_units_with_stats(page, page_number, debug_assignments)
     for offset, unit in enumerate(units):
         unit.id = first_unit_id + offset
     return units
@@ -520,11 +648,19 @@ def extract_pdf(pdf_path: Path, debug_assignments: bool = False) -> ExtractionRe
     try:
         for page_index in range(document.page_count):
             page = document[page_index]
-            units, table_count, ambiguous = _extract_page_units_with_stats(
+            units, table_count, ambiguous, source_objects = _extract_page_units_with_stats(
                 page, page_index + 1, debug_assignments
             )
+            local_to_global = {
+                unit.id: next_unit_id + offset for offset, unit in enumerate(units)
+            }
             for offset, unit in enumerate(units):
                 unit.id = next_unit_id + offset
+            for source in source_objects:
+                source.unit_ids = [
+                    local_to_global[unit_id] for unit_id in source.unit_ids
+                    if unit_id in local_to_global
+                ]
             next_unit_id += len(units)
             detected_tables += table_count
             ambiguous_assignments += ambiguous
@@ -534,16 +670,17 @@ def extract_pdf(pdf_path: Path, debug_assignments: bool = False) -> ExtractionRe
                 height=float(page.rect.height),
                 rotation=int(page.rotation),
                 units=units,
+                source_objects=source_objects,
             ))
     finally:
         document.close()
-    return ExtractionResult(
+    return analyze_document_semantics(ExtractionResult(
         source_file=Path(pdf_path).name,
         pymupdf_version=str(getattr(fitz, "VersionBind", "unknown")),
         pages=pages,
         detected_tables=detected_tables,
         ambiguous_table_assignments=ambiguous_assignments,
-    )
+    ))
 
 
 def save_extraction(result: ExtractionResult, output_path: Path) -> None:

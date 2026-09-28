@@ -151,6 +151,29 @@ def test_extraction_json_is_valid(tmp_path: Path):
     assert payload["text_extraction_options"] == {"sort": True}
     assert payload["pages"][0]["page_number"] == 1
     assert payload["pages"][0]["units"][0]["translate"] is True
+    assert payload["schema_version"] == 2
+    assert payload["pages"][0]["source_objects"][0]["id"].startswith("p0001/")
+
+
+def test_source_object_ids_are_deterministic_across_extractions(tmp_path: Path):
+    import fitz
+
+    pdf_path = tmp_path / "input.pdf"
+    document = fitz.open()
+    page = document.new_page(width=200, height=100)
+    page.insert_text((20, 30), "Stable source identity")
+    document.save(pdf_path)
+    document.close()
+
+    first = extract_pdf(pdf_path).to_dict()["pages"][0]
+    second = extract_pdf(pdf_path).to_dict()["pages"][0]
+
+    assert [(item["id"], item["bbox"]) for item in first["source_objects"]] == [
+        (item["id"], item["bbox"]) for item in second["source_objects"]
+    ]
+    span_ids = [item["id"] for item in first["source_objects"] if item["kind"] == "span"]
+    assert span_ids == ["p0001/b0001/l0001/s0001"]
+    assert span_ids[0] in first["units"][0]["source_ids"]
 
 
 def test_skipped_units_remain_in_extraction_json(tmp_path: Path):

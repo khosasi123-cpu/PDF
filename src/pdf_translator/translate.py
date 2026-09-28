@@ -7,6 +7,7 @@ import os
 from dotenv import load_dotenv
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -166,7 +167,7 @@ def _validate_translation_item(item: Any, expected: dict[int, dict[str, Any]]) -
     if not isinstance(item, dict):
         raise BatchValidationError("Each translation must be an object")
     if set(item) not in ({"id", "translation"}, {"id", "source", "translation"}):
-        raise BatchValidationError("Each translation must contain id and translation only")
+        raise BatchValidationError("Each translation must contain id, translation, and optional source only")
     unit_id = item.get("id")
     if not isinstance(unit_id, int) or isinstance(unit_id, bool):
         raise BatchValidationError(f"Invalid translation ID: {unit_id!r}")
@@ -175,9 +176,12 @@ def _validate_translation_item(item: Any, expected: dict[int, dict[str, Any]]) -
     if "source" in item and item["source"] != expected[unit_id]["source"]:
         raise BatchValidationError(f"Source mismatch for ID {unit_id}")
     translation = item["translation"]
-    if not isinstance(translation, str) or not translation.strip():
-        translation = expected[unit_id]["source"]
     source = expected[unit_id]["source"]
+    if not isinstance(translation, str):
+        raise BatchValidationError(f"Translation for ID {unit_id} must be a string")
+    if not translation.strip():
+        LOGGER.warning("Unit %s returned an empty translation; using source text", unit_id)
+        translation = source
     return {
         "id": unit_id,
         "source": source,
@@ -186,9 +190,16 @@ def _validate_translation_item(item: Any, expected: dict[int, dict[str, Any]]) -
 
 
 def validate_response(payload: dict[str, Any], expected_units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if set(payload) != {"translations"}:
+        raise BatchValidationError("Response must contain only the translations field")
     raw_translations = payload.get("translations")
     if not isinstance(raw_translations, list):
         raise BatchValidationError("Response must contain a translations list")
+    expected_ids_list = [unit.get("id") for unit in expected_units]
+    if any(not isinstance(unit_id, int) or isinstance(unit_id, bool) for unit_id in expected_ids_list):
+        raise BatchValidationError("Expected unit IDs must be integers")
+    if len(expected_ids_list) != len(set(expected_ids_list)):
+        raise BatchValidationError("Expected unit IDs must be unique")
     expected = {unit["id"]: unit for unit in expected_units}
     returned_ids = [item.get("id") if isinstance(item, dict) else None for item in raw_translations]
     duplicate_ids = sorted({unit_id for unit_id in returned_ids if returned_ids.count(unit_id) > 1})
@@ -212,8 +223,76 @@ def _request_payload(units: list[dict[str, Any]]) -> str:
 
 def _plain_text(value: str) -> str:
     value = re.sub(r"<br\s*/?>", "\n", value, flags=re.IGNORECASE)
-    value = re.sub(r"</?(?:b|i|strong|em)>|`", "", value, flags=re.IGNORECASE)
-    return value.replace("**", "").replace("*", "")
+    return re.sub(r"</?(?:b|i|strong|em)>", "", value, flags=re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class SanitizationResult:
+    text: str
+    issues: tuple[str, ...] = ()
+
+
+_META_PREFIX = re.compile(
+    r"^\s*(?:here is (?:the )?translation|translation|terjemahan|certainly|as an ai)\s*[:,-]",
+    re.IGNORECASE,
+)
+_META_PARENTHETICAL = re.compile(
+    r"\((?:no changes? (?:are )?needed|tidak ada perubahan|as an ai|karena kalimat ini)[^)]*\)",
+    re.IGNORECASE,
+)
+
+
+def _private_use_characters(text: str) -> tuple[str, ...]:
+    return tuple(character for character in text if unicodedata.category(character) == "Co")
+
+
+def _normalized_sentences(text: str) -> list[str]:
+    return [
+        " ".join(part.casefold().split())
+        for part in re.split(r"(?<=[.!?])\s+|\n+", text)
+        if len(" ".join(part.split())) >= 20
+    ]
+
+
+def sanitize_translation(source: str, translation: str) -> SanitizationResult:
+    if not translation.strip():
+        return SanitizationResult(source)
+    issues: list[str] = []
+    if _META_PREFIX.search(translation) or _META_PARENTHETICAL.search(translation):
+        issues.append("model commentary")
+    source_sentences = _normalized_sentences(source)
+    translated_sentences = _normalized_sentences(translation)
+    for left, right in zip(translated_sentences, translated_sentences[1:]):
+        if left == right and not any(
+            first == second == left for first, second in zip(source_sentences, source_sentences[1:])
+        ):
+            issues.append("repeated sentence")
+            break
+    compact_source = "".join(source.split())
+    compact_translation = "".join(translation.split())
+    if len(compact_translation) > max(len(compact_source) * 4, len(compact_source) + 160):
+        issues.append("extreme unexplained length growth")
+    if _private_use_characters(source) != _private_use_characters(translation):
+        issues.append("private-use glyph sequence changed")
+    return SanitizationResult(translation, tuple(issues))
+
+
+def _normalized_source(source: str) -> str:
+    source = unicodedata.normalize("NFC", source).replace("\r\n", "\n").replace("\r", "\n")
+    return "\n".join(" ".join(line.split()) for line in source.splitlines()).strip()
+
+
+def _translation_key(
+    unit: dict[str, Any], dictionary: TranslationDictionary | None,
+    source_language: str, target_language: str,
+) -> tuple[str, str, str, str, str]:
+    return (
+        source_language,
+        target_language,
+        dictionary.context_key() if dictionary is not None else "no-dictionary",
+        str(unit.get("unit_type", "text")),
+        _normalized_source(str(unit.get("source", ""))),
+    )
 
 
 def _replace_corresponding_phrase(text: str, source: str, term: str, replacement: str) -> str:
@@ -254,13 +333,36 @@ def translate_batches(
     units: list[dict[str, Any]], client: TranslationClient, model: str,
     batch_size: int = DEFAULT_BATCH_SIZE, max_retries: int = DEFAULT_MAX_RETRIES,
     dictionary: TranslationDictionary | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    warning_sink: list[dict[str, Any]] | None = None,
+    source_language: str = "English",
+    target_language: str = "Indonesian",
+) -> list[dict[str, Any]]:
     if batch_size < 1:
         raise TranslationError("batch_size must be at least 1")
 
-    batches = [units[index:index + batch_size] for index in range(0, len(units), batch_size)]
-    results: list[dict[str, Any]] = []
-    warnings: list[dict[str, Any]] = []
+    groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
+    for unit in units:
+        key = _translation_key(unit, dictionary, source_language, target_language)
+        groups.setdefault(key, []).append(unit)
+    representatives = [group[0] for group in groups.values()]
+    batches = [
+        representatives[index:index + batch_size]
+        for index in range(0, len(representatives), batch_size)
+    ]
+    representative_results: dict[int, dict[str, Any]] = {}
+    source_fallback_ids: set[int] = set()
+    warnings = warning_sink if warning_sink is not None else []
+
+    def messages_for(batch: list[dict[str, Any]], correction: str | None = None) -> list[dict[str, str]]:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": _request_payload(batch)},
+        ]
+        if dictionary is not None:
+            messages.insert(1, {"role": "system", "content": dictionary.context()})
+        if correction:
+            messages.append({"role": "user", "content": correction})
+        return messages
 
     for batch_number, batch in enumerate(batches, start=1):
         ids = [unit["id"] for unit in batch]
@@ -270,78 +372,87 @@ def translate_batches(
         last_error: Exception | None = None
 
         for attempt in range(max_retries + 1):
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": _request_payload(batch)},
-            ]
-
-            if dictionary is not None:
-                messages.insert(
-                    1,
-                    {"role": "system", "content": dictionary.context()},
-                )
-
+            correction = None
             if last_error is not None:
-                messages.append({
-                    "role": "user",
-                    "content": (
+                correction = (
                         "Correction for the previous response: return the complete batch "
                         "with exactly one translation object per input ID. "
                         "Return only valid JSON matching the required schema. "
                         f"Previous validation error: {last_error}"
-                    ),
-                })
+                    )
 
             try:
-                response = client.chat_completion(messages, model)
+                response = client.chat_completion(messages_for(batch, correction), model)
                 payload = extract_json_response(response)
                 validated = validate_response(payload, batch)
 
-                batch_unchanged: list[dict[str, Any]] = []
-
-                for item in validated:
-                    source = item["source"]
-                    translation = item["translation"]
-
-                    if (
-                        translation.strip() == source.strip()
-                        and _clearly_translatable(source)
-                    ):
-                        warning = {
-                            "id": item["id"],
-                            "source": source,
-                            "translation": translation,
-                            "note": "Model returned the source text unchanged",
-                        }
-                        batch_unchanged.append(warning)
-                        warnings.append(warning)
-
-                    if dictionary is not None:
-                        item["translation"], corrections = enforce_terminology(
-                            source,
-                            translation,
-                            dictionary,
+                suspicious = [
+                    (item, sanitize_translation(item["source"], item["translation"]))
+                    for item in validated
+                ]
+                retry_items = [item for item, result in suspicious if result.issues]
+                clean_items = [
+                    {**item, "translation": result.text}
+                    for item, result in suspicious if not result.issues
+                ]
+                if retry_items:
+                    issue_summary = "; ".join(
+                        f"ID {item['id']}: {', '.join(result.issues)}"
+                        for item, result in suspicious if result.issues
+                    )
+                    retry_batch = [
+                        next(unit for unit in batch if unit["id"] == item["id"])
+                        for item in retry_items
+                    ]
+                    try:
+                        retry_response = client.chat_completion(
+                            messages_for(
+                                retry_batch,
+                                "The previous translations contained invalid commentary, repetition, "
+                                "length growth, or altered private-use glyphs. Return clean translations "
+                                f"only. Problems: {issue_summary}",
+                            ),
+                            model,
                         )
-                        for correction in corrections:
+                        retry_validated = validate_response(
+                            extract_json_response(retry_response), retry_batch
+                        )
+                    except (BatchValidationError, ValueError, TypeError, TranslationError, OSError) as error:
+                        LOGGER.warning("Content retry failed: %s", error)
+                        retry_validated = []
+                    retry_by_id = {item["id"]: item for item in retry_validated}
+                    for original in retry_items:
+                        retry_item = retry_by_id.get(original["id"])
+                        retry_result = (
+                            sanitize_translation(retry_item["source"], retry_item["translation"])
+                            if retry_item is not None else None
+                        )
+                        if retry_item is not None and retry_result is not None and not retry_result.issues:
+                            clean_items.append({**retry_item, "translation": retry_result.text})
+                            continue
+                        source_fallback_ids.add(original["id"])
+                        issues = list(retry_result.issues) if retry_result is not None else ["invalid content retry"]
+                        warning = {
+                            "id": original["id"],
+                            "source": original["source"],
+                            "translation": original["source"],
+                            "note": f"Source fallback after sanitation: {', '.join(issues)}",
+                        }
+                        warnings.append(warning)
+                        LOGGER.warning("Unit %s source fallback: %s", original["id"], warning["note"])
+                        clean_items.append({**original, "translation": original["source"]})
+
+                for item in clean_items:
+                    if dictionary is not None and item["id"] not in source_fallback_ids and item["translation"] != item["source"]:
+                        item["translation"], corrections = enforce_terminology(
+                            item["source"], item["translation"], dictionary
+                        )
+                        for terminology_correction in corrections:
                             LOGGER.info(
                                 "Unit %s terminology correction: %s",
-                                item["id"],
-                                correction,
+                                item["id"], terminology_correction,
                             )
-
-                results.extend(validated)
-
-                if batch_unchanged:
-                    print(
-                        "Warning: unchanged translations: "
-                        f"{[item['id'] for item in batch_unchanged]}"
-                    )
-                    for item in batch_unchanged:
-                        LOGGER.warning(
-                            "Unit %s returned unchanged: %s",
-                            item["id"],
-                            item["source"],
-                        )
+                    representative_results[item["id"]] = item
 
                 print("Status: OK")
                 break
@@ -366,7 +477,22 @@ def translate_batches(
                 f"IDs={ids}: {last_error}"
             ) from last_error
 
-    return validate_response({"translations": results}, units), warnings
+    results: list[dict[str, Any]] = []
+    for group in groups.values():
+        representative = group[0]
+        translated = representative_results[representative["id"]]
+        representative_fallback = representative["id"] in source_fallback_ids
+        for unit in group:
+            translation = unit["source"] if representative_fallback else translated["translation"]
+            if dictionary is not None and not representative_fallback and translation != unit["source"]:
+                translation, _ = enforce_terminology(unit["source"], translation, dictionary)
+            results.append({
+                "id": unit["id"],
+                "source": unit["source"],
+                "translation": translation,
+            })
+    results.sort(key=lambda item: item["id"])
+    return validate_response({"translations": results}, units)
 
 def save_translation(
     output_path: Path, extraction_path: Path, extraction_payload: dict[str, Any],
@@ -435,22 +561,24 @@ def run_translation(
     print(f"Batch size: {config.batch_size}")
     print(f"Batches: {(len(translatable) + config.batch_size - 1) // config.batch_size}")
     print(f"Model: {config.model}")
-    translations, warnings = translate_batches(
+    warnings: list[dict[str, Any]] = []
+    translations = translate_batches(
         translatable,
         active_client,
         config.model,
         config.batch_size,
         config.max_retries,
         dictionary,
+        warning_sink=warnings,
     )
     translations = skipped_results + translations
 
     if warnings:
         print("\nTranslation Warnings")
         print("--------------------")
-        print(f"Unchanged translations: {len(warnings)}")
+        print(f"Sanitation fallbacks: {len(warnings)}")
         for warning in warnings:
-            print(f"- ID {warning['id']}: source returned unchanged")
+            print(f"- ID {warning['id']}: {warning['note']}")
     else:
         print("\nTranslation Warnings")
         print("--------------------")

@@ -3,6 +3,7 @@ from pathlib import Path
 
 import fitz
 
+from pdf_translator.layout import LayoutPlan
 from pdf_translator.render import _plain_text, render_pdf
 
 
@@ -12,7 +13,7 @@ def test_symbol_normalization_preserves_normal_text():
     assert _plain_text("Normal text") == "Normal text"
 
 
-def test_bullet_translation_uses_a_visible_symbol_font(tmp_path: Path):
+def test_bullet_translation_uses_visible_unicode_without_question_mark(tmp_path: Path):
     pdf_path, extraction_path, translation_path = _make_inputs(tmp_path)
     payload = json.loads(translation_path.read_text(encoding="utf-8"))
     payload["translations"][0]["translation"] = "● Test"
@@ -23,8 +24,8 @@ def test_bullet_translation_uses_a_visible_symbol_font(tmp_path: Path):
 
     assert stats.rendered_units == 1
     assert not stats.warnings
-    assert any("Symbols" in font[3] for font in rendered[0].get_fonts(full=True))
     assert "?" not in rendered[0].get_text()
+    assert "•" in rendered[0].get_text()
     rendered.close()
 
 
@@ -486,3 +487,156 @@ def test_overflow_translation_uses_html_last_resort(tmp_path: Path):
     assert stats.rendered_units == 1
     output_text = " ".join(fitz.open(output_path)[0].get_text().split())
     assert "A much longer valid translation" in output_text
+
+
+def test_structured_span_mismatch_falls_back_without_dropping_translation(tmp_path: Path):
+    pdf_path = tmp_path / "source.pdf"
+    document = fitz.open()
+    page = document.new_page(width=200, height=100)
+    page.insert_text((20, 25), "First", fontsize=8)
+    page.insert_text((20, 40), "Second", fontsize=8)
+    document.save(pdf_path)
+    document.close()
+    extraction_path = tmp_path / "extraction.json"
+    extraction_path.write_text(json.dumps({
+        "pages": [{"page_number": 1, "width": 200, "height": 100, "units": [{
+            "id": 1, "unit_type": "text", "source": "First\nSecond",
+            "bbox": [20, 15, 80, 42], "fontsize": 8, "flags": 0,
+            "line_count": 2, "translate": True,
+        }]}],
+    }), encoding="utf-8")
+    translation_path = tmp_path / "translation.json"
+    translation_path.write_text(json.dumps({
+        "translations": [{
+            "id": 1, "source": "First\nSecond", "translation": "Terjemahan gabungan",
+        }],
+    }), encoding="utf-8")
+    layout = LayoutPlan.model_validate({
+        "page_number": 1, "width": 200, "height": 100, "confidence": 0.9,
+        "source": "vision", "regions": [{
+            "id": "structured", "type": "structured", "bbox": [20, 15, 80, 42],
+            "reading_order": 0, "confidence": 0.9,
+            "recommended_strategy": "structured_region", "unit_ids": [1],
+        }],
+    })
+
+    output_path, stats = render_pdf(
+        pdf_path, extraction_path, translation_path, tmp_path / "out.pdf",
+        layout_plans={1: layout},
+    )
+
+    assert stats.rendered_units == 1
+    assert "Terjemahan gabungan" in " ".join(fitz.open(output_path)[0].get_text().split())
+    assert any("structured span mismatch" in warning for warning in stats.warnings)
+
+
+def test_render_plan_debug_artifacts_are_written(tmp_path: Path):
+    pdf_path, extraction_path, translation_path = _make_inputs(tmp_path)
+    debug_dir = tmp_path / "layout"
+
+    render_pdf(
+        pdf_path, extraction_path, translation_path, tmp_path / "out.pdf",
+        render_plan_debug_dir=debug_dir,
+        identity_debug_dir=debug_dir / "identity",
+    )
+
+    payload = json.loads((debug_dir / "page_001_render_plan.json").read_text(encoding="utf-8"))
+    assert payload["regions"][0]["strategy"] == "reflow_region"
+    assert (debug_dir / "page_001_render_plan_debug.png").exists()
+    identity = json.loads(
+        (debug_dir / "identity" / "render_identity.json").read_text(encoding="utf-8")
+    )
+    assert identity["units"][0]["translation_unit"] == 1
+    assert identity["units"][0]["source_ids"] == identity["units"][0]["final_source_ids"]
+    assert (debug_dir / "identity" / "source_page_001_overlay.png").exists()
+    assert (debug_dir / "identity" / "output_page_001_overlay.png").exists()
+
+
+def test_render_rejects_cross_document_artifacts(tmp_path: Path):
+    pdf_path, extraction_path, translation_path = _make_inputs(tmp_path)
+    extraction = json.loads(extraction_path.read_text(encoding="utf-8"))
+    extraction["source_file"] = "different.pdf"
+    extraction_path.write_text(json.dumps(extraction), encoding="utf-8")
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="Extraction source mismatch"):
+        render_pdf(pdf_path, extraction_path, translation_path, tmp_path / "out.pdf")
+
+
+def test_common_unicode_survives_rendering(tmp_path: Path):
+    pdf_path, extraction_path, translation_path = _make_inputs(tmp_path)
+    payload = json.loads(translation_path.read_text(encoding="utf-8"))
+    payload["translations"][0]["translation"] = "Café • arah → selesai"
+    translation_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    output_path, stats = render_pdf(pdf_path, extraction_path, translation_path, tmp_path / "out.pdf")
+    output_text = fitz.open(output_path)[0].get_text()
+
+    assert stats.rendered_units == 1
+    assert "Café" in output_text
+    assert "•" in output_text
+    assert "→" in output_text
+    assert "?" not in output_text
+
+
+def test_private_use_glyph_preserves_original_visual_unit(tmp_path: Path):
+    pdf_path, extraction_path, translation_path = _make_inputs(tmp_path)
+    extraction = json.loads(extraction_path.read_text(encoding="utf-8"))
+    extraction["pages"][0]["units"][0]["source"] = "\ue000 Hello"
+    extraction_path.write_text(json.dumps(extraction), encoding="utf-8")
+    translation = json.loads(translation_path.read_text(encoding="utf-8"))
+    translation["translations"][0].update({
+        "source": "\ue000 Hello", "translation": "\ue000 Halo",
+    })
+    translation_path.write_text(json.dumps(translation), encoding="utf-8")
+
+    output_path, stats = render_pdf(pdf_path, extraction_path, translation_path, tmp_path / "out.pdf")
+    output_text = fitz.open(output_path)[0].get_text()
+
+    assert "Hello" in output_text
+    assert "Halo" not in output_text
+    assert any("private-use glyph preserved" in warning for warning in stats.warnings)
+
+
+def test_toc_title_wrap_keeps_page_number_anchor_and_regenerates_leader(tmp_path: Path):
+    pdf_path = tmp_path / "source.pdf"
+    document = fitz.open()
+    page = document.new_page(width=220, height=100)
+    page.insert_text((20, 30), "Short title", fontsize=9)
+    page.insert_text((110, 30), "........", fontsize=9)
+    page.insert_text((185, 30), "49", fontsize=9)
+    document.save(pdf_path)
+    document.close()
+    extraction_path = tmp_path / "extraction.json"
+    extraction_path.write_text(json.dumps({
+        "pages": [{"page_number": 1, "width": 220, "height": 100, "units": [{
+            "id": 1, "unit_type": "toc_entry", "source": "Short title",
+            "bbox": [20, 20, 80, 32], "fontsize": 9, "flags": 0,
+            "line_count": 1, "translate": True, "metadata": {
+                "toc_page_number_bbox": [185, 20, 198, 32],
+                "toc_hierarchy_level": 0, "toc_column": 0,
+            },
+        }]}],
+    }), encoding="utf-8")
+    translation_path = tmp_path / "translation.json"
+    translation_path.write_text(json.dumps({
+        "translations": [{
+            "id": 1, "source": "Short title",
+            "translation": "Judul terjemahan panjang yang memerlukan baris kedua",
+        }],
+    }), encoding="utf-8")
+
+    output_path, stats = render_pdf(
+        pdf_path, extraction_path, translation_path, tmp_path / "out.pdf"
+    )
+    output_page = fitz.open(output_path)[0]
+    spans = [
+        span for block in output_page.get_text("dict")["blocks"] if block.get("type") == 0
+        for line in block.get("lines", []) for span in line.get("spans", [])
+    ]
+
+    assert stats.rendered_units == 1
+    assert any(span["text"] == "49" and round(span["bbox"][0]) == 185 for span in spans)
+    assert "." in output_page.get_text()
+    assert "Judul" in output_page.get_text()
