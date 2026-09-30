@@ -125,6 +125,9 @@ def test_render_reports_missing_translation_without_crashing(tmp_path: Path):
 
 def test_translation_markup_becomes_plain_text(tmp_path: Path):
     pdf_path, extraction_path, translation_path = _make_inputs(tmp_path)
+    extraction = json.loads(extraction_path.read_text(encoding="utf-8"))
+    extraction["pages"][0]["units"][0]["bbox"] = [15, 15, 100, 55]
+    extraction_path.write_text(json.dumps(extraction), encoding="utf-8")
     payload = json.loads(translation_path.read_text(encoding="utf-8"))
     payload["translations"][0]["translation"] = "<b>Halo</b><br>semua"
     translation_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -212,7 +215,7 @@ def test_table_cell_span_mismatch_uses_logged_logical_cell_fallback(tmp_path: Pa
     assert 20 <= y0 < y1 <= 60
 
 
-def test_multiline_fallback_translation_is_visible(tmp_path: Path):
+def test_multiline_below_typography_floor_preserves_source(tmp_path: Path):
     pdf_path = tmp_path / "source.pdf"
     document = fitz.open()
     page = document.new_page(width=240, height=120)
@@ -239,8 +242,9 @@ def test_multiline_fallback_translation_is_visible(tmp_path: Path):
 
     output_text = fitz.open(output_path)[0].get_text()
     assert stats.rendered_units == 1
-    assert not stats.warnings
-    assert "Translated 14" in output_text
+    assert any("typography floor" in warning for warning in stats.warnings)
+    assert "Source" in output_text
+    assert "Translated 14" not in output_text
 
 
 def test_compact_borderless_structured_text_is_rendered(tmp_path: Path):
@@ -570,7 +574,50 @@ def test_text_cover_does_not_erase_inline_vector_graphic(tmp_path: Path):
     assert pixel[0] > 200 and pixel[1] < 50 and pixel[2] < 50
 
 
-def test_overflow_translation_uses_html_last_resort(tmp_path: Path):
+def test_single_line_uses_source_baseline_without_textbox_shrink(tmp_path: Path):
+    pdf_path = tmp_path / "source.pdf"
+    document = fitz.open()
+    page = document.new_page(width=200, height=80)
+    page.insert_text((20, 30), "Heading", fontsize=12)
+    document.save(pdf_path)
+    document.close()
+    extraction_path = tmp_path / "extraction.json"
+    extraction_path.write_text(json.dumps({
+        "pages": [{
+            "page_number": 1,
+            "source_objects": [{
+                "id": "span", "kind": "span", "bbox": [20, 20, 70, 32],
+                "text": "Heading", "metadata": {"origin": [20, 30]},
+            }],
+            "units": [{
+                "id": 1, "unit_type": "text", "source": "Heading",
+                "bbox": [20, 20, 70, 32], "fontsize": 12, "flags": 16,
+                "line_count": 1, "translate": True, "source_ids": ["span"],
+            }],
+        }],
+    }), encoding="utf-8")
+    translation_path = tmp_path / "translation.json"
+    translation_path.write_text(json.dumps({
+        "translations": [{
+            "id": 1, "source": "Heading", "translation": "Judul",
+        }],
+    }), encoding="utf-8")
+
+    output_path, stats = render_pdf(
+        pdf_path, extraction_path, translation_path, tmp_path / "out.pdf"
+    )
+    spans = [
+        span for block in fitz.open(output_path)[0].get_text("dict")["blocks"]
+        if block.get("type") == 0 for line in block.get("lines", [])
+        for span in line.get("spans", []) if span["text"] == "Judul"
+    ]
+
+    assert stats.rendered_units == 1
+    assert len(spans) == 1
+    assert spans[0]["size"] == 12
+
+
+def test_overflow_below_typography_floor_preserves_source_without_masking(tmp_path: Path):
     pdf_path = tmp_path / "source.pdf"
     document = fitz.open()
     page = document.new_page(width=100, height=50)
@@ -590,14 +637,28 @@ def test_overflow_translation_uses_html_last_resort(tmp_path: Path):
         "translations": [{"id": 1, "source": "Short", "translation": "A much longer valid translation"}],
     }), encoding="utf-8")
 
-    output_path, stats = render_pdf(pdf_path, extraction_path, translation_path, tmp_path / "out.pdf")
+    identity_dir = tmp_path / "identity"
+    output_path, stats = render_pdf(
+        pdf_path,
+        extraction_path,
+        translation_path,
+        tmp_path / "out.pdf",
+        identity_debug_dir=identity_dir,
+    )
 
     assert stats.rendered_units == 1
     output_text = " ".join(fitz.open(output_path)[0].get_text().split())
-    assert "A much longer valid translation" in output_text
+    identity = json.loads(
+        (identity_dir / "render_identity.json").read_text(encoding="utf-8")
+    )["units"][0]
+    assert output_text == "Short"
+    assert identity["render_status"] == "source_fallback"
+    assert identity["font_size_ratio"] == 1
+    assert identity["mask_rectangles"] == []
+    assert identity["fallback_reason"] == "typography_floor"
 
 
-def test_structured_span_mismatch_falls_back_without_dropping_translation(tmp_path: Path):
+def test_structured_span_mismatch_preserves_source_composition(tmp_path: Path):
     pdf_path = tmp_path / "source.pdf"
     document = fitz.open()
     page = document.new_page(width=200, height=100)
@@ -628,14 +689,27 @@ def test_structured_span_mismatch_falls_back_without_dropping_translation(tmp_pa
         }],
     })
 
+    identity_dir = tmp_path / "identity"
     output_path, stats = render_pdf(
         pdf_path, extraction_path, translation_path, tmp_path / "out.pdf",
         layout_plans={1: layout},
+        identity_debug_dir=identity_dir,
     )
+    output_text = " ".join(fitz.open(output_path)[0].get_text().split())
+    identity = json.loads(
+        (identity_dir / "render_identity.json").read_text(encoding="utf-8")
+    )["units"][0]
 
     assert stats.rendered_units == 1
-    assert "Terjemahan gabungan" in " ".join(fitz.open(output_path)[0].get_text().split())
+    assert "First Second" in output_text
+    assert "Terjemahan gabungan" not in output_text
     assert any("structured span mismatch" in warning for warning in stats.warnings)
+    assert identity["render_status"] == "source_fallback"
+    assert identity["render_method"] == "source_preserved"
+    assert identity["font_size_ratio"] == 1
+    assert identity["mask_rectangles"] == []
+    assert identity["fallback_reason"] == "uncertain_fragment_mapping"
+    assert identity["visual_fallback_reason"] == "uncertain_fragment_mapping"
 
 
 def test_render_plan_debug_artifacts_are_written(tmp_path: Path):
@@ -656,7 +730,12 @@ def test_render_plan_debug_artifacts_are_written(tmp_path: Path):
     )
     assert identity["units"][0]["translation_unit"] == 1
     assert identity["units"][0]["source_ids"] == identity["units"][0]["final_source_ids"]
-    assert identity["units"][0]["final_bbox"] == [15.0, 15.0, 55.0, 35.0]
+    final_bbox = identity["units"][0]["final_bbox"]
+    assert 15 <= final_bbox[0] < final_bbox[2] <= 55
+    assert 15 <= final_bbox[1] < final_bbox[3] <= 35
+    assert identity["units"][0]["source_font_size"] == 11
+    assert identity["units"][0]["rendered_font_size"] is not None
+    assert identity["units"][0]["mask_rectangles"]
     assert identity["schema_version"] == 2
     assert len(identity["source_sha256"]) == 64
     assert len(identity["source_extraction_sha256"]) == 64
@@ -765,6 +844,9 @@ def test_render_rejects_duplicate_translation_ids(tmp_path: Path):
 
 def test_common_unicode_survives_rendering(tmp_path: Path):
     pdf_path, extraction_path, translation_path = _make_inputs(tmp_path)
+    extraction = json.loads(extraction_path.read_text(encoding="utf-8"))
+    extraction["pages"][0]["units"][0]["bbox"] = [15, 15, 150, 50]
+    extraction_path.write_text(json.dumps(extraction), encoding="utf-8")
     payload = json.loads(translation_path.read_text(encoding="utf-8"))
     payload["translations"][0]["translation"] = "Café • arah → selesai"
     translation_path.write_text(json.dumps(payload), encoding="utf-8")

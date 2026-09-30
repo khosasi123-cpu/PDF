@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import html
 import json
 import logging
@@ -30,6 +31,7 @@ DEFAULT_OUTPUT_DIR = Path("artifacts/rendered")
 DEFAULT_LAYOUT_DIR = Path("artifacts/layout")
 MIN_FONT_SIZE = 5.5
 STRUCTURED_MIN_FONT_SIZE = 4.5
+MIN_FONT_RATIO = 0.75
 STRUCTURED_Y_TOLERANCE = 1.5
 PADDING = 0.75
 CELL_BORDER_INSET = 1.5
@@ -54,6 +56,13 @@ class _StructuredSpan:
     source_rect: fitz.Rect
     render_rect: fitz.Rect
     origin: fitz.Point
+
+
+@dataclass(frozen=True)
+class _TextRenderResult:
+    fits: bool
+    font_size: float | None
+    method: str
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -144,6 +153,19 @@ def _owned_source_span_rects(
     ]
 
 
+def _metadata_source_rects(
+    unit: dict[str, Any], page_data: dict[str, Any], metadata_key: str
+) -> list[fitz.Rect]:
+    source_ids = set(unit.get("metadata", {}).get(metadata_key, []))
+    return [
+        fitz.Rect(source["bbox"])
+        for source in page_data.get("source_objects", [])
+        if source.get("id") in source_ids
+        and isinstance(source.get("bbox"), (list, tuple))
+        and len(source["bbox"]) == 4
+    ]
+
+
 def _source_origin(
     unit: dict[str, Any], page_data: dict[str, Any], fallback: fitz.Point
 ) -> fitz.Point:
@@ -162,6 +184,105 @@ def _unit_color(unit: dict[str, Any]) -> tuple[float, float, float]:
     if isinstance(color, int):
         return fitz.sRGB_to_pdf(color)
     return (0.0, 0.0, 0.0)
+
+
+def _render_single_line_baseline(
+    page: fitz.Page,
+    unit: dict[str, Any],
+    page_data: dict[str, Any],
+    text: str,
+    rect: fitz.Rect,
+    fontsize: float,
+    flags: int,
+    minimum_ratio: float = MIN_FONT_RATIO,
+    draw: bool = True,
+) -> tuple[_TextRenderResult, fitz.Rect] | None:
+    if (
+        "\n" in text
+        or int(unit.get("line_count", 1)) != 1
+        or _needs_unicode_fallback(text)
+    ):
+        return None
+    fontname = _font_name(flags)
+    source_origin = _source_origin(
+        unit, page_data, fitz.Point(rect.x0, rect.y0 + fontsize)
+    )
+    origin = fitz.Point(
+        max(rect.x0, min(source_origin.x, rect.x1)),
+        max(rect.y0 + min(fontsize, rect.height), min(source_origin.y, rect.y1)),
+    )
+    minimum_size = max(MIN_FONT_SIZE, fontsize * minimum_ratio)
+    size = _measure_structured_line(
+        text,
+        max(rect.x1 - origin.x, 1.0),
+        fontsize,
+        fontname,
+        minimum_size,
+    )
+    if size is None:
+        return None
+    if draw:
+        page.insert_text(
+            origin,
+            text,
+            fontsize=size,
+            fontname=fontname,
+            color=_unit_color(unit),
+            overlay=True,
+        )
+    drawn = fitz.Rect(
+        origin.x,
+        origin.y - size,
+        min(rect.x1, origin.x + fitz.get_text_length(text, fontname=fontname, fontsize=size)),
+        origin.y + size * 0.25,
+    )
+    return _TextRenderResult(True, size, "source_baseline"), drawn
+
+
+def _set_visual_diagnostics(
+    identity: dict[str, Any],
+    source_font_size: float,
+    rendered_font_size: float | None,
+    method: str | None,
+    obstacles: list[fitz.Rect],
+    masks: list[fitz.Rect],
+    safe_rect: fitz.Rect | None,
+    reason: str | None = None,
+) -> None:
+    identity["rendered_font_size"] = rendered_font_size
+    identity["font_size_ratio"] = (
+        rendered_font_size / source_font_size
+        if rendered_font_size is not None and source_font_size > 0
+        else None
+    )
+    identity["render_method"] = method
+    identity["detected_visual_obstacles"] = [list(rect) for rect in obstacles]
+    identity["mask_rectangles"] = [list(rect) for rect in masks]
+    identity["safe_render_bbox"] = list(safe_rect) if safe_rect is not None else None
+    identity["visual_fallback_reason"] = reason
+
+
+def _complete_visual_source_fallback(
+    identity: dict[str, Any],
+    rect: fitz.Rect,
+    source_text: str,
+    fontsize: float,
+    obstacles: list[fitz.Rect],
+    reason: str,
+) -> None:
+    _set_visual_diagnostics(
+        identity,
+        fontsize,
+        fontsize,
+        "source_preserved",
+        obstacles,
+        [],
+        rect,
+        reason,
+    )
+    complete_identity_record(
+        identity, [rect], source_text, "source_fallback", reason
+    )
 
 
 def _cover_rect(unit: dict[str, Any], rect: fitz.Rect) -> fitz.Rect:
@@ -438,8 +559,31 @@ def _page_filled_rects(page: fitz.Page) -> list[tuple[fitz.Rect, tuple[float, ..
 
 
 def _background_color(
-    rect: fitz.Rect, filled_rects: list[tuple[fitz.Rect, tuple[float, ...]]]
+    page: fitz.Page,
+    rect: fitz.Rect,
+    filled_rects: list[tuple[fitz.Rect, tuple[float, ...]]],
 ) -> tuple[float, ...]:
+    clip = rect & page.rect
+    if not clip.is_empty:
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(1, 1), clip=clip, alpha=False)
+        if pixmap.width > 0 and pixmap.height > 0:
+            samples: list[tuple[int, int, int]] = []
+            for x in range(pixmap.width):
+                samples.append(tuple(pixmap.pixel(x, 0)[:3]))
+                if pixmap.height > 1:
+                    samples.append(tuple(pixmap.pixel(x, pixmap.height - 1)[:3]))
+            for y in range(1, max(1, pixmap.height - 1)):
+                samples.append(tuple(pixmap.pixel(0, y)[:3]))
+                if pixmap.width > 1:
+                    samples.append(tuple(pixmap.pixel(pixmap.width - 1, y)[:3]))
+            if samples:
+                quantized = [tuple(round(channel / 16) * 16 for channel in sample) for sample in samples]
+                red, green, blue = Counter(quantized).most_common(1)[0][0]
+                return (
+                    min(red, 255) / 255,
+                    min(green, 255) / 255,
+                    min(blue, 255) / 255,
+                )
     center = fitz.Point((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
     candidates = [
         (filled.width * filled.height, color)
@@ -447,6 +591,87 @@ def _background_color(
         if filled.contains(center)
     ]
     return min(candidates, default=(0.0, (1.0, 1.0, 1.0)))[1]
+
+
+def _rect_area(rect: fitz.Rect) -> float:
+    return max(rect.width, 0.0) * max(rect.height, 0.0)
+
+
+def _intersection_area(left: fitz.Rect, right: fitz.Rect) -> float:
+    intersection = left & right
+    return 0.0 if intersection.is_empty else _rect_area(intersection)
+
+
+def _protected_visual_obstacles(
+    candidate: fitz.Rect,
+    source_rects: list[fitz.Rect],
+    image_rects: list[fitz.Rect],
+    graphic_rects: list[fitz.Rect],
+) -> list[fitz.Rect]:
+    result: list[fitz.Rect] = []
+    candidate_area = max(_rect_area(candidate), 1.0)
+    for obstacle in [*image_rects, *graphic_rects]:
+        if obstacle.is_empty or _intersection_area(candidate, obstacle) <= 0:
+            continue
+        is_graphic = obstacle in graphic_rects
+        if is_graphic and (
+            obstacle.width <= 2.0
+            or obstacle.height <= 2.0
+            or _rect_area(obstacle) >= candidate_area * 0.75
+        ):
+            continue
+        if any(
+            obstacle.contains(
+                fitz.Point((source.x0 + source.x1) / 2, (source.y0 + source.y1) / 2)
+            )
+            for source in source_rects
+        ):
+            continue
+        key = tuple(round(value, 2) for value in obstacle)
+        if not any(tuple(round(value, 2) for value in existing) == key for existing in result):
+            result.append(obstacle)
+    return result
+
+
+def _safe_render_area(
+    candidate: fitz.Rect,
+    source_rects: list[fitz.Rect],
+    obstacles: list[fitz.Rect],
+) -> fitz.Rect:
+    choices = [candidate]
+    for obstacle in obstacles:
+        next_choices: list[fitz.Rect] = []
+        padded = fitz.Rect(
+            obstacle.x0 - PADDING,
+            obstacle.y0 - PADDING,
+            obstacle.x1 + PADDING,
+            obstacle.y1 + PADDING,
+        )
+        for choice in choices:
+            if _intersection_area(choice, padded) <= 0:
+                next_choices.append(choice)
+                continue
+            next_choices.extend([
+                fitz.Rect(choice.x0, choice.y0, min(choice.x1, padded.x0), choice.y1),
+                fitz.Rect(max(choice.x0, padded.x1), choice.y0, choice.x1, choice.y1),
+                fitz.Rect(choice.x0, choice.y0, choice.x1, min(choice.y1, padded.y0)),
+                fitz.Rect(choice.x0, max(choice.y0, padded.y1), choice.x1, choice.y1),
+            ])
+        choices = [
+            choice for choice in next_choices
+            if choice.width >= 12.0 and choice.height >= MIN_FONT_SIZE * 1.2
+        ]
+        if not choices:
+            return candidate
+        choices.sort(
+            key=lambda choice: (
+                sum(_intersection_area(choice, source) for source in source_rects),
+                _rect_area(choice),
+            ),
+            reverse=True,
+        )
+        choices = choices[:16]
+    return choices[0] if choices else candidate
 
 
 def _safe_expanded_rect(
@@ -480,7 +705,7 @@ def _measure_fit(
     PDF text layer."""
     minimum_size = max(float(minimum_size), 1.0)
     current_size = max(float(fontsize), minimum_size)
-    while current_size >= minimum_size:
+    while True:
         result = page.new_shape().insert_textbox(
             rect,
             text,
@@ -491,17 +716,26 @@ def _measure_fit(
         )
         if result >= 0:
             return current_size
-        current_size -= 0.5
+        if current_size <= minimum_size:
+            break
+        current_size = max(minimum_size, current_size - 0.5)
     return None
 
 
-def _draw_text(page: fitz.Page, rect: fitz.Rect, text: str, fontsize: float, fontname: str) -> None:
+def _draw_text(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    text: str,
+    fontsize: float,
+    fontname: str,
+    color: tuple[float, float, float] = (0, 0, 0),
+) -> None:
     page.insert_textbox(
         rect,
         text,
         fontsize=fontsize,
         fontname=fontname,
-        color=(0, 0, 0),
+        color=color,
         align=0,
         overlay=True,
     )
@@ -512,22 +746,29 @@ def _measure_structured_line(
 ) -> float | None:
     current_size = max(float(fontsize), float(minimum_size), 1.0)
     minimum_size = max(float(minimum_size), 1.0)
-    while current_size >= minimum_size:
+    while True:
         if fitz.get_text_length(text, fontname=fontname, fontsize=current_size) <= width:
             return current_size
-        current_size -= 0.5
+        if current_size <= minimum_size:
+            break
+        current_size = max(minimum_size, current_size - 0.5)
     return None
 
 
 def _draw_structured_line(
-    page: fitz.Page, span: _StructuredSpan, text: str, fontsize: float, fontname: str
+    page: fitz.Page,
+    span: _StructuredSpan,
+    text: str,
+    fontsize: float,
+    fontname: str,
+    color: tuple[float, float, float] = (0, 0, 0),
 ) -> None:
     page.insert_text(
         span.origin,
         text,
         fontsize=fontsize,
         fontname=fontname,
-        color=(0, 0, 0),
+        color=color,
         overlay=True,
     )
 
@@ -556,18 +797,101 @@ def _insert_html_fallback(
     text: str,
     fontsize: float,
     flags: int,
-) -> bool:
+    minimum_size: float = MIN_FONT_SIZE,
+    color: tuple[float, float, float] = (0, 0, 0),
+) -> _TextRenderResult:
     escaped_lines = [html.escape(line) for line in text.splitlines()]
     lines = "<br>".join(escaped_lines)
     weight = "bold" if flags & 16 else "normal"
-    style = f"font-family: sans-serif; font-size: {max(float(fontsize), MIN_FONT_SIZE)}pt; font-weight: {weight};"
+    base_size = max(float(fontsize), minimum_size)
+    red, green, blue = (round(channel * 255) for channel in color)
+    style = (
+        f"font-family: sans-serif; font-size: {base_size}pt; font-weight: {weight}; "
+        f"color: rgb({red}, {green}, {blue});"
+    )
+    minimum_scale = min(1.0, minimum_size / base_size)
     spare_height, scale = page.insert_htmlbox(
         rect,
         f'<div style="{style}">{lines}</div>',
-        scale_low=0.25,
+        scale_low=minimum_scale,
         overlay=True,
     )
-    return spare_height >= 0 and scale > 0
+    fits = spare_height >= 0 and scale > 0
+    return _TextRenderResult(
+        fits=fits,
+        font_size=base_size * scale if fits else None,
+        method="html",
+    )
+
+
+def _preflight_html_fallback(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    text: str,
+    fontsize: float,
+    flags: int,
+    minimum_size: float,
+    color: tuple[float, float, float],
+) -> _TextRenderResult:
+    scratch = fitz.open()
+    try:
+        scratch_page = scratch.new_page(width=page.rect.width, height=page.rect.height)
+        return _insert_html_fallback(
+            scratch_page, rect, text, fontsize, flags, minimum_size, color
+        )
+    finally:
+        scratch.close()
+
+
+def _preflight_text_render(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    text: str,
+    fontsize: float,
+    flags: int,
+    minimum_size: float,
+    color: tuple[float, float, float],
+) -> bool:
+    if not _needs_unicode_fallback(text):
+        fontname = _font_name(flags)
+        if _measure_fit(page, rect, text, fontsize, fontname, minimum_size) is not None:
+            return True
+    return _preflight_html_fallback(
+        page, rect, text, fontsize, flags, minimum_size, color
+    ).fits
+
+
+def _preflight_source_spans(
+    page: fitz.Page,
+    spans: list[_StructuredSpan],
+    translated_lines: list[str],
+    fontsize: float,
+    flags: int,
+    color: tuple[float, float, float],
+) -> bool:
+    minimum_size = max(STRUCTURED_MIN_FONT_SIZE, fontsize * MIN_FONT_RATIO)
+    fontname = _font_name(flags)
+    for span, translated_line in zip(spans, translated_lines):
+        if _needs_unicode_fallback(translated_line):
+            if not _preflight_html_fallback(
+                page,
+                span.render_rect,
+                translated_line,
+                fontsize,
+                flags,
+                minimum_size,
+                color,
+            ).fits:
+                return False
+        elif _measure_structured_line(
+            translated_line,
+            span.render_rect.width,
+            fontsize,
+            fontname,
+            minimum_size,
+        ) is None:
+            return False
+    return True
 
 
 def _fit_text_with_fallbacks(
@@ -579,7 +903,8 @@ def _fit_text_with_fallbacks(
     obstacle_rects: list[fitz.Rect],
     minimum_size: float = MIN_FONT_SIZE,
     allow_expand: bool = True,
-) -> bool:
+    color: tuple[float, float, float] = (0, 0, 0),
+) -> _TextRenderResult:
     """Try, in order: (1) the original rect, (2) the rect grown into
     surrounding whitespace (never into another unit or an image), (3) an
     HTML box as a last resort. Exactly one of these ends up drawing text,
@@ -587,12 +912,14 @@ def _fit_text_with_fallbacks(
     fontname = _font_name(flags)
 
     if _needs_unicode_fallback(text):
-        return _insert_html_fallback(page, rect, text, fontsize, flags)
+        return _insert_html_fallback(
+            page, rect, text, fontsize, flags, minimum_size, color
+        )
 
     size = _measure_fit(page, rect, text, fontsize, fontname, minimum_size)
     if size is not None:
-        _draw_text(page, rect, text, size, fontname)
-        return True
+        _draw_text(page, rect, text, size, fontname, color)
+        return _TextRenderResult(True, size, "textbox")
 
     expanded = (
         _safe_expanded_rect(rect=rect, page_rect=page.rect, other_rects=obstacle_rects)
@@ -603,13 +930,15 @@ def _fit_text_with_fallbacks(
         size = _measure_fit(page, expanded, text, fontsize, fontname, minimum_size)
         if size is not None:
             page.draw_rect(expanded, color=(1, 1, 1), fill=(1, 1, 1), width=0, overlay=True)
-            _draw_text(page, expanded, text, size, fontname)
-            return True
+            _draw_text(page, expanded, text, size, fontname, color)
+            return _TextRenderResult(True, size, "expanded_textbox")
 
     # The caller has already covered the owned source glyphs. Covering the
     # whole allocation here would erase unrelated inline graphics or text.
     fallback_rect = expanded if expanded != rect else rect
-    return _insert_html_fallback(page, fallback_rect, text, fontsize, flags)
+    return _insert_html_fallback(
+        page, fallback_rect, text, fontsize, flags, minimum_size, color
+    )
 
 
 @dataclass
@@ -621,7 +950,10 @@ class RenderingPrimitives:
     filled_rects: list[tuple[fitz.Rect, tuple[float, ...]]]
 
     def cover(self, rect: fitz.Rect, background_aware: bool = False) -> None:
-        color = _background_color(rect, self.filled_rects) if background_aware else (1, 1, 1)
+        color = (
+            _background_color(self.page, rect, self.filled_rects)
+            if background_aware else (1, 1, 1)
+        )
         self.page.draw_rect(rect, color=color, fill=color, width=0, overlay=True)
 
     def render_textbox(
@@ -631,7 +963,8 @@ class RenderingPrimitives:
         fontsize: float,
         flags: int,
         minimum_size: float = MIN_FONT_SIZE,
-    ) -> bool:
+        color: tuple[float, float, float] = (0, 0, 0),
+    ) -> _TextRenderResult:
         return _fit_text_with_fallbacks(
             self.page,
             rect,
@@ -641,6 +974,7 @@ class RenderingPrimitives:
             self.obstacle_rects,
             minimum_size,
             allow_expand=False,
+            color=color,
         )
 
     def render_source_spans(
@@ -649,9 +983,13 @@ class RenderingPrimitives:
         translated_lines: list[str],
         fontsize: float,
         flags: int,
-    ) -> bool:
+        color: tuple[float, float, float] = (0, 0, 0),
+    ) -> _TextRenderResult:
         fits = True
+        sizes: list[float] = []
+        methods: set[str] = set()
         fontname = _font_name(flags)
+        minimum_size = max(STRUCTURED_MIN_FONT_SIZE, fontsize * MIN_FONT_RATIO)
         for span, translated_line in zip(spans, translated_lines):
             source_cover = fitz.Rect(
                 span.source_rect.x0 - 0.5,
@@ -661,24 +999,52 @@ class RenderingPrimitives:
             )
             self.cover(source_cover, background_aware=True)
             if _needs_unicode_fallback(translated_line):
-                fits = _insert_html_fallback(
-                    self.page, span.render_rect, translated_line, fontsize, flags
-                ) and fits
+                result = _insert_html_fallback(
+                    self.page,
+                    span.render_rect,
+                    translated_line,
+                    fontsize,
+                    flags,
+                    minimum_size,
+                    color,
+                )
+                fits = result.fits and fits
+                if result.font_size is not None:
+                    sizes.append(result.font_size)
+                methods.add(result.method)
                 continue
             size = _measure_structured_line(
                 translated_line,
                 span.render_rect.width,
                 fontsize,
                 fontname,
-                STRUCTURED_MIN_FONT_SIZE,
+                minimum_size,
             )
             if size is not None:
-                _draw_structured_line(self.page, span, translated_line, size, fontname)
+                _draw_structured_line(
+                    self.page, span, translated_line, size, fontname, color
+                )
+                sizes.append(size)
+                methods.add("source_span")
             else:
-                fits = _insert_html_fallback(
-                    self.page, span.render_rect, translated_line, fontsize, flags
-                ) and fits
-        return fits
+                result = _insert_html_fallback(
+                    self.page,
+                    span.render_rect,
+                    translated_line,
+                    fontsize,
+                    flags,
+                    minimum_size,
+                    color,
+                )
+                fits = result.fits and fits
+                if result.font_size is not None:
+                    sizes.append(result.font_size)
+                methods.add(result.method)
+        return _TextRenderResult(
+            fits,
+            min(sizes) if sizes else None,
+            "+".join(sorted(methods)) or "source_span",
+        )
 
 
 def _structured_mismatch_diagnostic(
@@ -882,6 +1248,9 @@ def render_pdf(
                 flags = int(unit.get("flags", 0))
                 identity["translation"] = structured_text
                 if text == source_text:
+                    _set_visual_diagnostics(
+                        identity, fontsize, fontsize, "source_preserved", [], [], rect
+                    )
                     complete_identity_record(
                         identity, [rect], source_text, "source_preserved",
                         "translation equals source",
@@ -891,6 +1260,10 @@ def render_pdf(
                 if _has_private_use(source_text) or _has_private_use(text):
                     stats.warnings.append(
                         f"Unit {unit_id}: private-use glyph preserved with original visual content"
+                    )
+                    _set_visual_diagnostics(
+                        identity, fontsize, fontsize, "source_preserved", [], [], rect,
+                        "private-use glyph preserved",
                     )
                     complete_identity_record(
                         identity, [rect], source_text, "source_preserved",
@@ -906,6 +1279,13 @@ def render_pdf(
                 fits = True
                 rendered_rects: list[fitz.Rect] = []
                 rendered_text = text
+                rendered_font_size: float | None = None
+                render_method: str | None = None
+                mask_rects: list[fitz.Rect] = []
+                source_covers = _owned_source_span_rects(unit, page_data)
+                toc_leader_covers: list[fitz.Rect] = []
+                planned_rect = fitz.Rect(instruction.bbox)
+                visual_reason = None
                 span_right_limit = None
                 parent_region = region_by_id.get(instruction.parent_region_id)
                 if (
@@ -919,6 +1299,19 @@ def render_pdf(
                         if (rect.x0 + rect.x1) / 2 <= midpoint
                         else parent_region.bbox[2]
                     )
+                    parent_rect = fitz.Rect(parent_region.bbox)
+                    if parent_rect.contains(rect):
+                        bounded = planned_rect & parent_rect
+                        if not bounded.is_empty:
+                            planned_rect = bounded
+                    else:
+                        visual_reason = "semantic parent does not contain source bbox"
+                visual_obstacles = _protected_visual_obstacles(
+                    planned_rect,
+                    source_covers,
+                    image_rects,
+                    graphic_rects,
+                )
                 if strategy in {
                     RenderingStrategy.STRUCTURED_REGION,
                     RenderingStrategy.SOURCE_SPAN_MAPPING,
@@ -974,15 +1367,48 @@ def render_pdf(
                 if structured_lines is not None:
                     rendered_rects = [item[0].render_rect for item in structured_lines]
                     rendered_text = structured_text
-                    fits = primitives.render_source_spans(
+                    if not _preflight_source_spans(
+                        page,
                         [item[0] for item in structured_lines],
                         [item[1] for item in structured_lines],
                         fontsize,
                         flags,
+                        _unit_color(unit),
+                    ):
+                        stats.warnings.append(
+                            f"Unit {unit_id}: source preserved at typography floor"
+                        )
+                        _complete_visual_source_fallback(
+                            identity,
+                            rect,
+                            source_text,
+                            fontsize,
+                            visual_obstacles,
+                            "typography_floor",
+                        )
+                        stats.rendered_units += 1
+                        continue
+                    mask_rects = [
+                        fitz.Rect(
+                            item[0].source_rect.x0 - 0.75,
+                            item[0].source_rect.y0 - 0.25,
+                            item[0].source_rect.x1 + 0.75,
+                            item[0].source_rect.y1 + 0.25,
+                        )
+                        for item in structured_lines
+                    ]
+                    render_result = primitives.render_source_spans(
+                        [item[0] for item in structured_lines],
+                        [item[1] for item in structured_lines],
+                        fontsize,
+                        flags,
+                        _unit_color(unit),
                     )
+                    fits = render_result.fits
+                    rendered_font_size = render_result.font_size
+                    render_method = render_result.method
                 elif structured_cell_fallback:
                     cover = _cover_rect(unit, rect)
-                    primitives.cover(cover, background_aware=True)
                     text_rect = fitz.Rect(
                         cover.x0 + PADDING,
                         cover.y0 + PADDING,
@@ -991,31 +1417,70 @@ def render_pdf(
                     )
                     rendered_rects = [text_rect]
                     fontname = _font_name(flags)
-                    size = _measure_fit(page, text_rect, text, fontsize, fontname, STRUCTURED_MIN_FONT_SIZE)
-                    if size is not None:
-                        _draw_text(page, text_rect, text, size, fontname)
-                    else:
-                        fits = _insert_html_fallback(page, text_rect, text, fontsize, flags)
-                elif structured_mismatch:
-                    cover = _cover_rect(unit, rect)
-                    if cover.width <= 0 or cover.height <= 0:
-                        stats.warnings.append(f"Unit {unit_id}: invalid structured fallback rectangle")
-                        complete_identity_record(
-                            identity, [], source_text, "failed",
-                            "invalid structured fallback rectangle",
+                    minimum_size = max(
+                        STRUCTURED_MIN_FONT_SIZE, fontsize * MIN_FONT_RATIO
+                    )
+                    if not _preflight_text_render(
+                        page,
+                        text_rect,
+                        text,
+                        fontsize,
+                        flags,
+                        minimum_size,
+                        _unit_color(unit),
+                    ):
+                        stats.warnings.append(
+                            f"Unit {unit_id}: source preserved at typography floor"
                         )
+                        _complete_visual_source_fallback(
+                            identity,
+                            rect,
+                            source_text,
+                            fontsize,
+                            visual_obstacles,
+                            "typography_floor",
+                        )
+                        stats.rendered_units += 1
                         continue
                     primitives.cover(cover, background_aware=True)
-                    text_rect = fitz.Rect(
-                        cover.x0 + PADDING,
-                        cover.y0 + PADDING,
-                        cover.x1 - PADDING,
-                        cover.y1 - PADDING,
+                    mask_rects = [cover]
+                    size = _measure_fit(
+                        page, text_rect, text, fontsize, fontname, minimum_size
                     )
-                    rendered_rects = [text_rect]
-                    fits = primitives.render_textbox(
-                        text_rect, text, fontsize, flags, STRUCTURED_MIN_FONT_SIZE
+                    if size is not None:
+                        _draw_text(
+                            page, text_rect, text, size, fontname, _unit_color(unit)
+                        )
+                        rendered_font_size = size
+                        render_method = "structured_cell_textbox"
+                    else:
+                        render_result = _insert_html_fallback(
+                            page,
+                            text_rect,
+                            text,
+                            fontsize,
+                            flags,
+                            minimum_size,
+                            _unit_color(unit),
+                        )
+                        fits = render_result.fits
+                        rendered_font_size = render_result.font_size
+                        render_method = render_result.method
+                elif structured_mismatch:
+                    # Without one-to-one field evidence, reflowing all translated
+                    # text into the parent can detach labels from their values and
+                    # visual children. Preserve the intact source composition.
+                    fallback_reason = "uncertain_fragment_mapping"
+                    _complete_visual_source_fallback(
+                        identity,
+                        rect,
+                        source_text,
+                        fontsize,
+                        visual_obstacles,
+                        fallback_reason,
                     )
+                    stats.rendered_units += 1
+                    continue
                 else:
                     cover = _cover_rect(unit, rect)
                     if cover.width <= 0 or cover.height <= 0:
@@ -1024,22 +1489,11 @@ def render_pdf(
                             identity, [], source_text, "failed", "invalid cover rectangle"
                         )
                         continue
-                    source_covers = _owned_source_span_rects(unit, page_data)
-                    if source_covers:
-                        for source_cover in source_covers:
-                            primitives.cover(
-                                fitz.Rect(
-                                    source_cover.x0 - 0.5,
-                                    source_cover.y0,
-                                    source_cover.x1 + 0.5,
-                                    source_cover.y1,
-                                ),
-                                background_aware=True,
-                            )
-                    else:
-                        primitives.cover(cover, background_aware=True)
                     toc_anchor: tuple[float, float, float, float] | None = None
                     if strategy == RenderingStrategy.TOC_REGION:
+                        toc_leader_covers = _metadata_source_rects(
+                            unit, page_data, "toc_leader_source_ids"
+                        )
                         anchor = instruction.page_number_anchor
                         toc_anchor = anchor
                         text_rect = rect
@@ -1057,7 +1511,7 @@ def render_pdf(
                                 max(rect.y1, min(next_top - PADDING, rect.y0 + rect.height * 2.2)),
                             )
                     elif strategy == RenderingStrategy.EXPAND_REGION:
-                        text_rect = fitz.Rect(instruction.bbox)
+                        text_rect = planned_rect
                     else:
                         text_rect = fitz.Rect(
                             cover.x0 + PADDING,
@@ -1065,46 +1519,161 @@ def render_pdf(
                             cover.x1 - PADDING,
                             cover.y1 - PADDING,
                         )
-                    direct_toc_size = None
-                    if strategy == RenderingStrategy.TOC_REGION and "\n" not in text:
-                        direct_toc_size = _measure_structured_line(
+                    if (
+                        strategy != RenderingStrategy.TOC_REGION
+                        and "\n" not in text
+                        and int(unit.get("line_count", 1)) == 1
+                        and parent_region is not None
+                        and parent_region.type != RegionType.MULTI_COLUMN
+                        and parent_region.bbox is not None
+                        and fitz.Rect(parent_region.bbox).contains(rect)
+                        and _measure_structured_line(
                             text,
                             text_rect.width,
                             fontsize,
                             _font_name(flags),
-                            MIN_FONT_SIZE,
+                            max(MIN_FONT_SIZE, fontsize * 0.75),
+                        ) is None
+                    ):
+                        expanded = _safe_expanded_rect(
+                            text_rect,
+                            fitz.Rect(parent_region.bbox),
+                            [*unit_rects, *image_rects, *graphic_rects],
                         )
-                    if direct_toc_size is not None:
-                        origin = _source_origin(
+                        if expanded != text_rect:
+                            text_rect = expanded
+                            visual_reason = "single-line text expanded inside semantic parent"
+                    if strategy != RenderingStrategy.TOC_REGION:
+                        visual_obstacles = _protected_visual_obstacles(
+                            text_rect,
+                            source_covers,
+                            image_rects,
+                            graphic_rects,
+                        )
+                        safe_text_rect = _safe_render_area(
+                            text_rect, source_covers, visual_obstacles
+                        )
+                        if safe_text_rect != text_rect:
+                            text_rect = safe_text_rect
+                            visual_reason = "render area reduced around protected visual obstacles"
+                    minimum_size = max(MIN_FONT_SIZE, fontsize * MIN_FONT_RATIO)
+                    baseline_preflight = _render_single_line_baseline(
+                        page,
+                        unit,
+                        page_data,
+                        text,
+                        text_rect,
+                        fontsize,
+                        flags,
+                        draw=False,
+                    )
+                    if baseline_preflight is None and not _preflight_text_render(
+                        page,
+                        text_rect,
+                        text,
+                        fontsize,
+                        flags,
+                        minimum_size,
+                        _unit_color(unit),
+                    ):
+                        stats.warnings.append(
+                            f"Unit {unit_id}: source preserved at typography floor"
+                        )
+                        _complete_visual_source_fallback(
+                            identity,
+                            rect,
+                            source_text,
+                            fontsize,
+                            visual_obstacles,
+                            "typography_floor",
+                        )
+                        stats.rendered_units += 1
+                        continue
+                    if source_covers:
+                        for source_cover in source_covers:
+                            mask = fitz.Rect(
+                                source_cover.x0 - 0.75,
+                                source_cover.y0 - 0.25,
+                                source_cover.x1 + 0.75,
+                                source_cover.y1 + 0.25,
+                            )
+                            mask_rects.append(mask)
+                            primitives.cover(mask, background_aware=True)
+                    else:
+                        primitives.cover(cover, background_aware=True)
+                        mask_rects = [cover]
+                    for leader_cover in toc_leader_covers:
+                        leader_mask = fitz.Rect(
+                            leader_cover.x0 - 0.5,
+                            leader_cover.y0 - 0.25,
+                            leader_cover.x1 + 0.5,
+                            leader_cover.y1 + 0.25,
+                        )
+                        mask_rects.append(leader_mask)
+                        primitives.cover(leader_mask, background_aware=True)
+                    if baseline_preflight is not None:
+                        baseline_render = _render_single_line_baseline(
+                            page,
                             unit,
                             page_data,
-                            fitz.Point(rect.x0, rect.y1 - 1.0),
-                        )
-                        page.insert_text(
-                            origin,
                             text,
-                            fontsize=direct_toc_size,
-                            fontname=_font_name(flags),
-                            color=_unit_color(unit),
-                            overlay=True,
+                            text_rect,
+                            fontsize,
+                            flags,
                         )
-                        fits = True
-                        rendered_rects = [fitz.Rect(
-                            origin.x,
-                            origin.y - direct_toc_size,
-                            min(
-                                text_rect.x1,
-                                origin.x + fitz.get_text_length(
-                                    text, fontname=_font_name(flags), fontsize=direct_toc_size
+                        assert baseline_render is not None
+                        render_result, rendered_rect = baseline_render
+                        fits = render_result.fits
+                        rendered_font_size = render_result.font_size
+                        render_method = render_result.method
+                        rendered_rects = [rendered_rect]
+                        if toc_anchor is not None:
+                            leader_start = rendered_rect.x1 + PADDING
+                            leader_end = toc_anchor[0] - PADDING
+                            dot_size = min(
+                                rendered_font_size or fontsize,
+                                max(MIN_FONT_SIZE, fontsize),
+                            )
+                            dot_width = max(
+                                fitz.get_text_length(
+                                    ".", fontname="helv", fontsize=dot_size
                                 ),
-                            ),
-                            origin.y + direct_toc_size * 0.25,
-                        )]
+                                1.0,
+                            )
+                            count = int(max(0.0, leader_end - leader_start) / dot_width)
+                            if count >= 2:
+                                baseline = min(toc_anchor[3] - 1.0, rendered_rect.y1)
+                                page.insert_text(
+                                    (leader_start, baseline),
+                                    "." * count,
+                                    fontsize=dot_size,
+                                    fontname="helv",
+                                    color=_unit_color(unit),
+                                    overlay=True,
+                                )
                     else:
-                        fits = primitives.render_textbox(
-                            text_rect, text, fontsize, flags, MIN_FONT_SIZE
+                        render_result = primitives.render_textbox(
+                            text_rect,
+                            text,
+                            fontsize,
+                            flags,
+                            minimum_size,
+                            _unit_color(unit),
                         )
+                        fits = render_result.fits
+                        rendered_font_size = render_result.font_size
+                        render_method = render_result.method
                         rendered_rects = [text_rect]
+                _set_visual_diagnostics(
+                    identity,
+                    fontsize,
+                    rendered_font_size,
+                    render_method,
+                    visual_obstacles,
+                    mask_rects,
+                    rendered_rects[0] if rendered_rects else None,
+                    visual_reason,
+                )
                 if not fits:
                     stats.warnings.append(f"Unit {unit_id}: text overflow at minimum font size")
                     status = "rendered_overflow"
