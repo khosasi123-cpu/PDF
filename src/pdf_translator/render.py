@@ -14,7 +14,12 @@ from typing import Any
 import fitz
 
 from .layout import LayoutPlan, RegionType, RenderingStrategy, fallback_layout_plan, resolve_layout_plan_geometry
-from .render_plan import PageGeometry, RenderPlan, RenderPlanner
+from .render_plan import (
+    PageGeometry,
+    RenderPlan,
+    RenderPlanner,
+    safe_expansion_candidates,
+)
 from .identity import (
     complete_identity_record,
     identity_record,
@@ -63,6 +68,14 @@ class _TextRenderResult:
     fits: bool
     font_size: float | None
     method: str
+
+
+@dataclass(frozen=True)
+class _StructuredFieldFragment:
+    source_spans: tuple[_StructuredSpan, ...]
+    field_rect: fitz.Rect
+    render_rect: fitz.Rect
+    text: str
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -674,6 +687,140 @@ def _safe_render_area(
     return choices[0] if choices else candidate
 
 
+def _structured_field_fragments(
+    source_text: str,
+    translation: str,
+    spans: list[_StructuredSpan],
+    rect: fitz.Rect,
+    obstacles: list[fitz.Rect],
+) -> list[_StructuredFieldFragment] | None:
+    source_lines = [line.strip() for line in source_text.splitlines()]
+    translated_lines = [line.strip() for line in translation.splitlines()]
+    if (
+        len(source_lines) != len(spans)
+        or not source_lines
+        or any(not line for line in source_lines)
+        or any(not line for line in translated_lines)
+    ):
+        return None
+
+    tolerance = max(2.0, min(span.source_rect.height for span in spans) * 0.5)
+    anchor_groups: list[list[float]] = []
+    for x in sorted(span.source_rect.x0 for span in spans):
+        if anchor_groups and abs(x - sum(anchor_groups[-1]) / len(anchor_groups[-1])) <= tolerance:
+            anchor_groups[-1].append(x)
+        else:
+            anchor_groups.append([x])
+    if len(anchor_groups) != 2:
+        return None
+    label_anchor, value_anchor = (
+        sum(group) / len(group) for group in anchor_groups
+    )
+
+    source_labels = [
+        index for index, line in enumerate(source_lines) if line.endswith(":")
+    ]
+    translated_labels = [
+        index for index, line in enumerate(translated_lines) if line.endswith(":")
+    ]
+    if len(source_labels) < 2 or len(source_labels) != len(translated_labels):
+        return None
+    if any(
+        abs(spans[index].source_rect.x0 - label_anchor) > tolerance
+        for index in source_labels
+    ):
+        return None
+    if any(
+        abs(span.source_rect.x0 - value_anchor) > tolerance
+        for index, span in enumerate(spans)
+        if index not in source_labels
+    ):
+        return None
+
+    fragments: list[_StructuredFieldFragment] = []
+
+    def add_value_fragment(
+        source_group: list[_StructuredSpan],
+        lines: list[str],
+        top: float,
+        bottom: float,
+    ) -> bool:
+        if not source_group or not lines or bottom <= top:
+            return False
+        candidate = fitz.Rect(value_anchor, top, rect.x1, bottom)
+        local_obstacles = [
+            obstacle for obstacle in obstacles
+            if _intersection_area(candidate, obstacle) > 0
+        ]
+        safe_rect = _safe_render_area(
+            candidate,
+            [span.source_rect for span in source_group],
+            local_obstacles,
+        )
+        fragments.append(_StructuredFieldFragment(
+            tuple(source_group), candidate, safe_rect, "\n".join(lines)
+        ))
+        return True
+
+    first_source_label = source_labels[0]
+    first_translated_label = translated_labels[0]
+    if bool(first_source_label) != bool(first_translated_label):
+        return None
+    if first_source_label and not add_value_fragment(
+        spans[:first_source_label],
+        translated_lines[:first_translated_label],
+        min(span.source_rect.y0 for span in spans[:first_source_label]),
+        spans[first_source_label].source_rect.y0 - PADDING,
+    ):
+        return None
+
+    for field_index, source_label_index in enumerate(source_labels):
+        translated_label_index = translated_labels[field_index]
+        next_source_index = (
+            source_labels[field_index + 1]
+            if field_index + 1 < len(source_labels)
+            else len(spans)
+        )
+        next_translated_index = (
+            translated_labels[field_index + 1]
+            if field_index + 1 < len(translated_labels)
+            else len(translated_lines)
+        )
+        label_span = spans[source_label_index]
+        value_spans = spans[source_label_index + 1:next_source_index]
+        translated_values = translated_lines[
+            translated_label_index + 1:next_translated_index
+        ]
+        bottom = (
+            spans[next_source_index].source_rect.y0 - PADDING
+            if next_source_index < len(spans)
+            else rect.y1
+        )
+        label_rect = fitz.Rect(
+            label_span.source_rect.x0,
+            label_span.source_rect.y0,
+            value_anchor - PADDING,
+            bottom,
+        )
+        if label_rect.width <= 0 or label_rect.height <= 0:
+            return None
+        fragments.append(_StructuredFieldFragment(
+            (label_span,), label_rect, label_rect,
+            translated_lines[translated_label_index],
+        ))
+        if not add_value_fragment(
+            value_spans,
+            translated_values,
+            label_span.source_rect.y0,
+            bottom,
+        ):
+            return None
+
+    if "\n".join(fragment.text for fragment in fragments).splitlines() != translated_lines:
+        return None
+    return fragments
+
+
 def _safe_expanded_rect(
     rect: fitz.Rect,
     page_rect: fitz.Rect,
@@ -859,6 +1006,148 @@ def _preflight_text_render(
     return _preflight_html_fallback(
         page, rect, text, fontsize, flags, minimum_size, color
     ).fits
+
+
+def _obstacle_free_row_slots(
+    candidate: fitz.Rect,
+    obstacles: list[fitz.Rect],
+    minimum_height: float,
+) -> list[fitz.Rect]:
+    padded_obstacles = [
+        fitz.Rect(
+            obstacle.x0 - PADDING,
+            obstacle.y0 - PADDING,
+            obstacle.x1 + PADDING,
+            obstacle.y1 + PADDING,
+        ) & candidate
+        for obstacle in obstacles
+        if _intersection_area(candidate, obstacle) > 0
+    ]
+    y_edges = sorted({
+        candidate.y0,
+        candidate.y1,
+        *(
+            coordinate
+            for obstacle in padded_obstacles
+            for coordinate in (obstacle.y0, obstacle.y1)
+            if candidate.y0 < coordinate < candidate.y1
+        ),
+    })
+    slots: list[fitz.Rect] = []
+    for top, bottom in zip(y_edges, y_edges[1:]):
+        if bottom - top < minimum_height:
+            continue
+        intervals = [(candidate.x0, candidate.x1)]
+        for obstacle in padded_obstacles:
+            if obstacle.y1 <= top or obstacle.y0 >= bottom:
+                continue
+            next_intervals: list[tuple[float, float]] = []
+            for left, right in intervals:
+                if obstacle.x1 <= left or obstacle.x0 >= right:
+                    next_intervals.append((left, right))
+                    continue
+                if obstacle.x0 - left >= 12.0:
+                    next_intervals.append((left, obstacle.x0))
+                if right - obstacle.x1 >= 12.0:
+                    next_intervals.append((obstacle.x1, right))
+            intervals = next_intervals
+        slots.extend(
+            fitz.Rect(left, top, right, bottom)
+            for left, right in intervals
+            if right - left >= 12.0
+        )
+    return sorted(slots, key=lambda slot: (slot.y0, slot.x0))
+
+
+def _flow_text_across_slots(
+    page: fitz.Page,
+    text: str,
+    slots: list[fitz.Rect],
+    fontsize: float,
+    flags: int,
+    minimum_size: float,
+    color: tuple[float, float, float],
+) -> list[tuple[fitz.Rect, str]] | None:
+    words = text.split()
+    if not words or len(slots) < 2:
+        return None
+
+    def assign(slot_index: int, word_index: int) -> list[tuple[fitz.Rect, str]] | None:
+        if word_index == len(words):
+            return []
+        if slot_index == len(slots):
+            return None
+        for end in range(len(words), word_index, -1):
+            candidate_text = " ".join(words[word_index:end])
+            if not _preflight_text_render(
+                page,
+                slots[slot_index],
+                candidate_text,
+                fontsize,
+                flags,
+                minimum_size,
+                color,
+            ):
+                continue
+            remainder = assign(slot_index + 1, end)
+            if remainder is not None:
+                return [(slots[slot_index], candidate_text), *remainder]
+        return assign(slot_index + 1, word_index)
+
+    return assign(0, 0)
+
+
+def _resolve_structured_field_slots(
+    page: fitz.Page,
+    fragments: list[_StructuredFieldFragment],
+    obstacles: list[fitz.Rect],
+    fontsize: float,
+    flags: int,
+    minimum_size: float,
+    color: tuple[float, float, float],
+) -> list[_StructuredFieldFragment] | None:
+    resolved: list[_StructuredFieldFragment] = []
+    for fragment in fragments:
+        if _preflight_text_render(
+            page,
+            fragment.render_rect,
+            fragment.text,
+            fontsize,
+            flags,
+            minimum_size,
+            color,
+        ):
+            resolved.append(fragment)
+            continue
+        if len(fragment.source_spans) < 2:
+            return None
+        local_obstacles = [
+            obstacle for obstacle in obstacles
+            if _intersection_area(fragment.field_rect, obstacle) > 0
+        ]
+        slots = _obstacle_free_row_slots(
+            fragment.field_rect,
+            local_obstacles,
+            minimum_size * 1.2,
+        )
+        assignment = _flow_text_across_slots(
+            page,
+            fragment.text,
+            slots,
+            fontsize,
+            flags,
+            minimum_size,
+            color,
+        )
+        if assignment is None:
+            return None
+        resolved.extend(
+            _StructuredFieldFragment(
+                fragment.source_spans, slot, slot, assigned_text
+            )
+            for slot, assigned_text in assignment
+        )
+    return resolved
 
 
 def _preflight_source_spans(
@@ -1274,6 +1563,7 @@ def render_pdf(
                 strategy = instruction.strategy
 
                 structured_lines = None
+                structured_fields = None
                 structured_mismatch = False
                 structured_cell_fallback = False
                 fits = True
@@ -1293,14 +1583,14 @@ def render_pdf(
                     and parent_region.type == RegionType.MULTI_COLUMN
                     and parent_region.bbox is not None
                 ):
-                    midpoint = (parent_region.bbox[0] + parent_region.bbox[2]) / 2
-                    span_right_limit = (
-                        midpoint - PADDING
-                        if (rect.x0 + rect.x1) / 2 <= midpoint
-                        else parent_region.bbox[2]
-                    )
                     parent_rect = fitz.Rect(parent_region.bbox)
                     if parent_rect.contains(rect):
+                        midpoint = (parent_region.bbox[0] + parent_region.bbox[2]) / 2
+                        span_right_limit = (
+                            midpoint - PADDING
+                            if (rect.x0 + rect.x1) / 2 <= midpoint
+                            else parent_region.bbox[2]
+                        )
                         bounded = planned_rect & parent_rect
                         if not bounded.is_empty:
                             planned_rect = bounded
@@ -1348,6 +1638,14 @@ def render_pdf(
                         )
                     ):
                         structured_mismatch = True
+                        if not is_table_cell:
+                            structured_fields = _structured_field_fragments(
+                                source_text,
+                                structured_text,
+                                structured_spans,
+                                rect,
+                                visual_obstacles,
+                            )
                         fallback_rect = None
                         if is_table_cell:
                             fallback_rect = fitz.Rect(
@@ -1407,6 +1705,65 @@ def render_pdf(
                     fits = render_result.fits
                     rendered_font_size = render_result.font_size
                     render_method = render_result.method
+                elif structured_fields is not None:
+                    minimum_size = max(
+                        STRUCTURED_MIN_FONT_SIZE, fontsize * MIN_FONT_RATIO
+                    )
+                    structured_fields = _resolve_structured_field_slots(
+                        page,
+                        structured_fields,
+                        visual_obstacles,
+                        fontsize,
+                        flags,
+                        minimum_size,
+                        _unit_color(unit),
+                    )
+                    if structured_fields is None:
+                        stats.warnings.append(
+                            f"Unit {unit_id}: structured fields preserved at typography floor"
+                        )
+                        _complete_visual_source_fallback(
+                            identity,
+                            rect,
+                            source_text,
+                            fontsize,
+                            visual_obstacles,
+                            "typography_floor",
+                        )
+                        stats.rendered_units += 1
+                        continue
+                    mask_rects = [
+                        fitz.Rect(
+                            span.source_rect.x0 - 0.75,
+                            span.source_rect.y0 - 0.25,
+                            span.source_rect.x1 + 0.75,
+                            span.source_rect.y1 + 0.25,
+                        )
+                        for span in structured_spans
+                    ]
+                    for mask in mask_rects:
+                        primitives.cover(mask, background_aware=True)
+                    results = [
+                        primitives.render_textbox(
+                            fragment.render_rect,
+                            fragment.text,
+                            fontsize,
+                            flags,
+                            minimum_size,
+                            _unit_color(unit),
+                        )
+                        for fragment in structured_fields
+                    ]
+                    fits = all(result.fits for result in results)
+                    rendered_font_size = min(
+                        result.font_size for result in results
+                        if result.font_size is not None
+                    )
+                    render_method = "structured_fields"
+                    rendered_rects = [
+                        fragment.render_rect for fragment in structured_fields
+                    ]
+                    rendered_text = structured_text
                 elif structured_cell_fallback:
                     cover = _cover_rect(unit, rect)
                     text_rect = fitz.Rect(
@@ -1567,15 +1924,94 @@ def render_pdf(
                         flags,
                         draw=False,
                     )
-                    if baseline_preflight is None and not _preflight_text_render(
-                        page,
-                        text_rect,
-                        text,
-                        fontsize,
-                        flags,
-                        minimum_size,
+                    text_preflight = baseline_preflight is not None or _preflight_text_render(
+                        page, text_rect, text, fontsize, flags, minimum_size,
                         _unit_color(unit),
-                    ):
+                    )
+                    if not text_preflight and strategy != RenderingStrategy.TOC_REGION:
+                        expansion_bounds = fitz.Rect(page.rect)
+                        if (
+                            parent_region is not None
+                            and parent_region.bbox is not None
+                            and fitz.Rect(parent_region.bbox).contains(rect)
+                        ):
+                            parent_bounds = fitz.Rect(parent_region.bbox)
+                            if parent_region.type == RegionType.MULTI_COLUMN:
+                                midpoint = (parent_bounds.x0 + parent_bounds.x1) / 2
+                                if (rect.x0 + rect.x1) / 2 <= midpoint:
+                                    expansion_bounds = fitz.Rect(
+                                        parent_bounds.x0,
+                                        parent_bounds.y0,
+                                        midpoint - PADDING,
+                                        parent_bounds.y1,
+                                    )
+                                else:
+                                    expansion_bounds = fitz.Rect(
+                                        midpoint + PADDING,
+                                        parent_bounds.y0,
+                                        parent_bounds.x1,
+                                        parent_bounds.y1,
+                                    )
+                            else:
+                                expansion_bounds = parent_bounds
+                        expansion_obstacles = [
+                            _bbox_tuple(obstacle)
+                            for obstacle in [*unit_rects, *image_rects, *graphic_rects]
+                        ]
+                        fixed_band = (
+                            region_by_id.get(instruction.region_id) is not None
+                            and region_by_id[instruction.region_id].type in {
+                                RegionType.HEADING,
+                                RegionType.HEADER,
+                                RegionType.FOOTER,
+                                RegionType.RUNNING_HEADER,
+                                RegionType.RUNNING_FOOTER,
+                            }
+                        )
+                        for candidate_bbox in safe_expansion_candidates(
+                            _bbox_tuple(rect),
+                            _bbox_tuple(expansion_bounds),
+                            expansion_obstacles,
+                        ):
+                            candidate = fitz.Rect(candidate_bbox)
+                            if fixed_band and candidate.height > rect.height + PADDING:
+                                continue
+                            candidate_obstacles = _protected_visual_obstacles(
+                                candidate,
+                                source_covers,
+                                image_rects,
+                                graphic_rects,
+                            )
+                            safe_candidate = _safe_render_area(
+                                candidate, source_covers, candidate_obstacles
+                            )
+                            candidate_baseline = _render_single_line_baseline(
+                                page,
+                                unit,
+                                page_data,
+                                text,
+                                safe_candidate,
+                                fontsize,
+                                flags,
+                                draw=False,
+                            )
+                            if candidate_baseline is None and not _preflight_text_render(
+                                page,
+                                safe_candidate,
+                                text,
+                                fontsize,
+                                flags,
+                                minimum_size,
+                                _unit_color(unit),
+                            ):
+                                continue
+                            text_rect = safe_candidate
+                            visual_obstacles = candidate_obstacles
+                            baseline_preflight = candidate_baseline
+                            text_preflight = True
+                            visual_reason = "translation expanded into collision-free local space"
+                            break
+                    if not text_preflight:
                         stats.warnings.append(
                             f"Unit {unit_id}: source preserved at typography floor"
                         )

@@ -6,7 +6,13 @@ import pytest
 
 from pdf_translator.layout import LayoutPlan
 from pdf_translator.identity import payload_sha256, sha256_file
-from pdf_translator.render import _extracted_structured_spans, _plain_text, render_pdf
+from pdf_translator.render import (
+    _extracted_structured_spans,
+    _flow_text_across_slots,
+    _obstacle_free_row_slots,
+    _plain_text,
+    render_pdf,
+)
 
 
 def test_symbol_normalization_preserves_normal_text():
@@ -658,6 +664,63 @@ def test_overflow_below_typography_floor_preserves_source_without_masking(tmp_pa
     assert identity["fallback_reason"] == "typography_floor"
 
 
+def test_fixed_heading_retries_collision_free_local_expansion(tmp_path: Path):
+    pdf_path = tmp_path / "source.pdf"
+    document = fitz.open()
+    page = document.new_page(width=200, height=80)
+    page.insert_text((20, 30), "Hint", fontsize=9, fontname="hebo")
+    document.save(pdf_path)
+    document.close()
+    extraction_path = tmp_path / "extraction.json"
+    extraction_path.write_text(json.dumps({
+        "pages": [{
+            "page_number": 1,
+            "width": 200,
+            "height": 80,
+            "source_objects": [{
+                "id": "span", "kind": "span", "bbox": [20, 21, 40, 31],
+                "text": "Hint", "metadata": {"origin": [20, 30]},
+            }],
+            "units": [{
+                "id": 1, "unit_type": "text", "source": "Hint",
+                "bbox": [20, 21, 40, 31], "fontsize": 9, "flags": 16,
+                "line_count": 1, "translate": True, "source_ids": ["span"],
+            }],
+        }],
+    }), encoding="utf-8")
+    translation_path = tmp_path / "translation.json"
+    translation_path.write_text(json.dumps({
+        "translations": [{
+            "id": 1, "source": "Hint", "translation": "Petunjuk",
+        }],
+    }), encoding="utf-8")
+    layout = LayoutPlan.model_validate({
+        "page_number": 1, "width": 200, "height": 80,
+        "confidence": 1, "source": "vision", "regions": [{
+            "id": "heading", "type": "heading", "bbox": [20, 21, 40, 31],
+            "reading_order": 0, "confidence": 1,
+            "recommended_strategy": "preserve_region", "unit_ids": [1],
+        }],
+    })
+    identity_dir = tmp_path / "identity"
+
+    output_path, stats = render_pdf(
+        pdf_path, extraction_path, translation_path, tmp_path / "out.pdf",
+        layout_plans={1: layout}, identity_debug_dir=identity_dir,
+    )
+
+    identity = json.loads(
+        (identity_dir / "render_identity.json").read_text(encoding="utf-8")
+    )["units"][0]
+    assert stats.rendered_units == 1
+    assert "Petunjuk" in fitz.open(output_path)[0].get_text()
+    assert identity["render_status"] == "rendered"
+    assert identity["font_size_ratio"] >= 0.75
+    assert identity["visual_fallback_reason"] == (
+        "translation expanded into collision-free local space"
+    )
+
+
 def test_structured_span_mismatch_preserves_source_composition(tmp_path: Path):
     pdf_path = tmp_path / "source.pdf"
     document = fitz.open()
@@ -710,6 +773,141 @@ def test_structured_span_mismatch_preserves_source_composition(tmp_path: Path):
     assert identity["mask_rectangles"] == []
     assert identity["fallback_reason"] == "uncertain_fragment_mapping"
     assert identity["visual_fallback_reason"] == "uncertain_fragment_mapping"
+
+
+def test_structured_fields_map_by_anchors_and_labels_not_line_count(tmp_path: Path):
+    pdf_path = tmp_path / "source.pdf"
+    document = fitz.open()
+    page = document.new_page(width=300, height=150)
+    source_lines = (
+        (100, 30, "CPU value"),
+        (20, 45, "Memory:"),
+        (100, 45, "1 GB or more"),
+        (20, 60, "Hard disk:"),
+        (100, 60, "3 GB or more required"),
+        (100, 75, "for installation"),
+        (20, 90, "Monitor:"),
+        (100, 90, "1024 x 768 or better"),
+        (100, 105, "recommended"),
+    )
+    source_objects = []
+    for index, (x, y, value) in enumerate(source_lines, 1):
+        source_id = f"span-{index}"
+        page.insert_text((x, y), value, fontsize=8)
+        source_objects.append({
+            "id": source_id,
+            "kind": "span",
+            "bbox": [x, y - 8, x + fitz.get_text_length(value, fontsize=8), y + 1],
+            "text": value,
+            "metadata": {"origin": [x, y]},
+        })
+    page.draw_rect(fitz.Rect(160, 97, 205, 106), color=(1, 0, 0), fill=(1, 0, 0))
+    document.save(pdf_path)
+    document.close()
+
+    source = "\n".join(value for _, _, value in source_lines)
+    translation = (
+        "Nilai CPU\nMemori:\n1 GB atau lebih\nHard disk:\n"
+        "Diperlukan 3 GB atau lebih untuk instalasi\nMonitor:\n"
+        "Resolusi 1024 x 768 atau lebih baik direkomendasikan"
+    )
+    extraction_path = tmp_path / "extraction.json"
+    extraction_path.write_text(json.dumps({
+        "pages": [{
+            "page_number": 1,
+            "width": 300,
+            "height": 150,
+            "source_objects": source_objects,
+            "units": [{
+                "id": 1,
+                "unit_type": "text",
+                "source": source,
+                "bbox": [20, 22, 260, 106],
+                "fontsize": 8,
+                "flags": 0,
+                "line_count": len(source_lines),
+                "translate": True,
+                "source_ids": [item["id"] for item in source_objects],
+            }],
+        }],
+    }), encoding="utf-8")
+    translation_path = tmp_path / "translation.json"
+    translation_path.write_text(json.dumps({
+        "translations": [{
+            "id": 1, "source": source, "translation": translation,
+        }],
+    }), encoding="utf-8")
+    layout = LayoutPlan.model_validate({
+        "page_number": 1,
+        "width": 300,
+        "height": 150,
+        "confidence": 1,
+        "source": "vision",
+        "regions": [{
+            "id": "structured",
+            "type": "structured",
+            "bbox": [20, 22, 260, 106],
+            "reading_order": 0,
+            "confidence": 1,
+            "recommended_strategy": "structured_region",
+            "unit_ids": [1],
+        }],
+    })
+    identity_dir = tmp_path / "identity"
+
+    output_path, stats = render_pdf(
+        pdf_path,
+        extraction_path,
+        translation_path,
+        tmp_path / "out.pdf",
+        layout_plans={1: layout},
+        identity_debug_dir=identity_dir,
+    )
+
+    output_text = " ".join(fitz.open(output_path)[0].get_text().split())
+    identity = json.loads(
+        (identity_dir / "render_identity.json").read_text(encoding="utf-8")
+    )["units"][0]
+    assert stats.rendered_units == 1
+    assert all(value in output_text for value in (
+        "Nilai CPU", "Memori:", "1 GB atau lebih", "Hard disk:",
+        "Diperlukan 3 GB", "Monitor:", "Resolusi 1024",
+    ))
+    assert identity["render_status"] == "rendered"
+    assert identity["render_method"] == "structured_fields"
+    assert identity["fallback_reason"] is None
+    assert len(identity["final_bboxes"]) == 7
+
+
+def test_structured_value_flows_across_row_slots_around_obstacle():
+    document = fitz.open()
+    page = document.new_page(width=595, height=842)
+    candidate = fitz.Rect(119.042, 211.788, 269.682, 229.788)
+    slots = _obstacle_free_row_slots(
+        candidate,
+        [fitz.Rect(175.2, 221.104, 219.3, 229.084)],
+        5.985 * 1.2,
+    )
+
+    text = "Resolusi 1024 × 768 atau lebih baik direkomendasikan sekali."
+    assignment = _flow_text_across_slots(
+        page,
+        text,
+        slots,
+        7.98,
+        0,
+        5.985,
+        (0, 0, 0),
+    )
+
+    assert assignment is not None
+    assert len(assignment) >= 2
+    assert " ".join(value for _, value in assignment) == text
+    assert all(
+        not (rect & fitz.Rect(174.45, 220.354, 220.05, 229.788)).get_area()
+        for rect, _ in assignment
+    )
+    document.close()
 
 
 def test_render_plan_debug_artifacts_are_written(tmp_path: Path):
