@@ -2,6 +2,8 @@ import argparse
 import logging
 from pathlib import Path
 import sys
+import time
+
 
 import fitz
 
@@ -82,6 +84,9 @@ def main() -> int:
     rendered_output = args.rendered_output or document_dir / f"{pdf_path.stem}_id.pdf"
     if args.debug_assignments:
         logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(message)s")
+
+    pipeline_started_at = time.perf_counter()
+
     try:
         print("PHASE 1: Extraction")
         result = extract_pdf(pdf_path, debug_assignments=args.debug_assignments)
@@ -104,10 +109,21 @@ def main() -> int:
         print(f"Vision analyzed pages: {vision_pages}/{len(layout_plans)}")
 
         print("\nPHASE 2: Translation")
+
+        translation_started_at = time.perf_counter()
+
         run_translation(
             extraction_path=extraction_output,
             output_path=translation_output,
             dictionary_path=args.dictionary,
+        )
+
+        translation_duration = time.perf_counter() - translation_started_at
+        translation_minutes, translation_seconds = divmod(translation_duration, 60)
+        print(
+            f"Translation duration: "
+            f"{int(translation_minutes)}m {translation_seconds:.2f}s "
+            f"({translation_duration:.2f} seconds)"
         )
 
         print("\nPHASE 3: Rendering")
@@ -122,6 +138,15 @@ def main() -> int:
         )
         with fitz.open(pdf_path) as original:
             print_summary(pdf_path, rendered_path, original.page_count, render_stats)
+
+        pipeline_duration = time.perf_counter() - pipeline_started_at
+        pipeline_minutes, pipeline_seconds = divmod(pipeline_duration, 60)
+        print(
+            f"\nTotal pipeline duration: "
+            f"{int(pipeline_minutes)}m {pipeline_seconds:.2f}s "
+            f"({pipeline_duration:.2f} seconds)"
+        )
+
         return 0
     except (RuntimeError, TranslationError, OSError) as error:
         print(f"Pipeline failed: {error}", file=sys.stderr)
