@@ -18,7 +18,7 @@ On Linux, use `.venv/bin/python` instead.
 .\.venv\Scripts\python.exe -m pdf_translator.main data/input/test.pdf
 ```
 
-Add `--debug-assignments` to log each text-to-cell assignment, including table/cell coordinates, bboxes, and whether containment or overlap selected the cell.
+Add `--debug-assignments` to log each text-to-cell assignment, including table/cell coordinates, bboxes, and whether containment or overlap selected the cell. Add `--debug-artifacts` only when diagnostic PNGs and overlays are needed; JSON planning and identity artifacts are still written during normal runs.
 
 ## Full pipeline
 
@@ -28,7 +28,7 @@ Run the entire pipeline from the project root with one command:
 .\.venv\Scripts\python.exe -m pdf_translator.main data/input/test.pdf
 ```
 
-This runs extraction, dictionary-aware translation, and rendering in order. It writes `extraction.json`, `preview.pdf`, `translation.json`, and the final `artifacts/rendered/test_id.pdf`. The source PDF is not overwritten. The local vLLM server must already be running before this command.
+This runs extraction, dictionary-aware translation, and rendering in order. It writes `extraction.json`, `preview.pdf`, `translation.json`, layout artifacts, and the final PDF under `artifacts/documents/<name>-<source-hash>/`. The source PDF is not overwritten. The local model server must already be running before this command.
 
 Use the separate commands when rerunning only one stage:
 
@@ -45,7 +45,8 @@ Install the OpenAI-compatible client with the project dependencies, then configu
 $env:LLM_BASE_URL = "http://localhost:1234/v1"
 $env:OPENAI_API_KEY = "local-key"
 $env:MODEL = "your-local-mistral-model"
-$env:TRANSLATION_BATCH_SIZE = "20"
+$env:TRANSLATION_BATCH_SIZE = "30"
+$env:TRANSLATION_MAX_BATCH_CHARACTERS = "6000"
 $env:TRANSLATION_MAX_RETRIES = "2"
 ```
 
@@ -79,19 +80,19 @@ The output is `artifacts/rendered/test_id.pdf`. The renderer uses the original P
 
 ## Adaptive layout planning
 
-The full pipeline writes validated LayoutPlans and RenderPlans to `artifacts/layout/<document>/`. Set `VISION_MODEL` and either `VISION_BASE_URL` or `LLM_BASE_URL` to enable local Ministral Vision analysis. If vision is unavailable, malformed, or low-confidence, extraction-based layout heuristics are used automatically.
+The full pipeline writes validated LayoutPlans and RenderPlans to the document-scoped layout directory. Set `VISION_MODEL` and either `VISION_BASE_URL` or `LLM_BASE_URL` to enable local Ministral Vision analysis. If vision is unavailable, malformed, or low-confidence, extraction-based layout heuristics are used automatically. Vision requests use a compact semantic response, run with up to two page requests concurrently by default, and can be forced to serial execution with `--vision-workers 1`.
 
 LayoutPlan recommendations are not drawing commands. `RenderPlanner` validates them against source spans, font fit, page and column bounds, neighboring text, images, and vector graphics. It then selects one of the small deterministic strategies: preserve, reflow, structured, multicolumn, preserve image, source-span mapping, safe expansion, or original-bbox fallback. PyMuPDF remains the only drawing implementation.
 
-Each page has a LayoutPlan JSON/debug PNG and a RenderPlan JSON/debug PNG. Image regions with embedded text are preserved and reported; text inside images is not translated yet.
+Each page has a LayoutPlan JSON and RenderPlan JSON. Add `--debug-artifacts` to also write their debug PNGs and source/output identity overlays. Image regions with embedded text are preserved and reported; text inside images is not translated yet.
 
-Extraction assigns deterministic page-local IDs to PDF blocks, lines, spans, images, and detected cells. Vision regions reference these IDs, and Python resolves their union from PyMuPDF geometry. Model bboxes are retained only for diagnostics when PDF-backed geometry exists; genuinely visual-only regions are marked `vision_estimate`.
+Extraction assigns deterministic page-local IDs to PDF blocks, lines, spans, images, and detected cells. Vision returns compact unit IDs and image indexes without bboxes or source IDs. Python maps those references back to authoritative PyMuPDF source geometry and ownership.
 
 A document-level deterministic pass identifies repeated running headers/footers, source-separated TOC entries, and conservative borderless key/value grids. Headers and footers remain fixed to their source bands. TOC titles are translated independently while page-number anchors remain untouched and leader dots are regenerated deterministically.
 
-Translation validation separates structural failures from content sanitation. Empty output falls back to source, unchanged technical text is accepted, and obvious commentary, repeated sentences, extreme growth, or altered private-use glyphs receive one targeted retry before source fallback. Identical normalized source units of the same type reuse one translation within the current document run.
+Translation validation separates structural failures from content sanitation. Empty output falls back to source, unchanged technical text is accepted, and obvious commentary, repeated sentences, extreme growth, or altered private-use glyphs receive one targeted retry before source fallback. Identical normalized source units of the same type reuse one translation within the current document run. Batches are limited by both unit count and source characters, while the output-token limit is calculated from each batch size.
 
-The command writes `artifacts/extraction/extraction.json` and `artifacts/extraction/preview.pdf` without modifying the input PDF. The preview keeps the original content and overlays green rectangles for normal text units, blue rectangles for table-cell units, and red rectangles for skipped units, with unit IDs beside them.
+The full command writes document-scoped `extraction.json` and `preview.pdf` without modifying the input PDF. The preview keeps the original content and overlays green rectangles for normal text units, blue rectangles for table-cell units, and red rectangles for skipped units, with unit IDs beside them.
 
 A smoke-test PDF can be generated with:
 

@@ -197,6 +197,7 @@ def save_identity_artifacts(
     output_dir: Path,
     extraction_path: Path | None = None,
     translation_path: Path | None = None,
+    write_debug_images: bool = True,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     coverage: list[dict[str, Any]] = []
@@ -287,6 +288,8 @@ def save_identity_artifacts(
     (output_dir / "render_identity.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    if not write_debug_images:
+        return
     by_page: dict[int, list[dict[str, Any]]] = {}
     for record in records:
         by_page.setdefault(int(record["page_number"]), []).append(record)

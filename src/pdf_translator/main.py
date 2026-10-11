@@ -9,7 +9,11 @@ import fitz
 
 from .extractor import extract_pdf, save_extraction
 from .identity import sha256_file
-from .layout_analysis import OpenAIMinistralVisionClient, analyze_document_layout
+from .layout_analysis import (
+    DEFAULT_VISION_WORKERS,
+    OpenAIMinistralVisionClient,
+    analyze_document_layout,
+)
 from .preview import create_preview
 from .render import print_summary, render_pdf
 from .translate import (
@@ -21,6 +25,13 @@ from .translate import (
 
 DEFAULT_EXTRACTION_PATH = Path("artifacts/extraction/extraction.json")
 DEFAULT_PREVIEW_PATH = Path("artifacts/extraction/preview.pdf")
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be at least 1")
+    return parsed
 
 
 def _print_summary(pdf_path: Path, result) -> None:
@@ -72,6 +83,17 @@ def main() -> int:
     parser.add_argument("--translation-output", type=Path, default=None)
     parser.add_argument("--rendered-output", type=Path, default=None)
     parser.add_argument("--layout-output-dir", type=Path, default=None)
+    parser.add_argument(
+        "--vision-workers",
+        type=_positive_int,
+        default=DEFAULT_VISION_WORKERS,
+        help="Maximum concurrent vision page requests (default: 2)",
+    )
+    parser.add_argument(
+        "--debug-artifacts",
+        action="store_true",
+        help="Write diagnostic PNGs in addition to JSON artifacts",
+    )
     args = parser.parse_args()
     pdf_path = args.pdf.resolve()
     document_dir = (
@@ -103,6 +125,8 @@ def main() -> int:
             result.to_dict(),
             layout_output_dir,
             client=OpenAIMinistralVisionClient.from_environment(),
+            max_workers=args.vision_workers,
+            write_debug_images=args.debug_artifacts,
         )
         vision_pages = sum(plan.source == "vision" for plan in layout_plans.values())
         print(f"Layout plans: {layout_output_dir}")
@@ -135,6 +159,7 @@ def main() -> int:
             layout_plans=layout_plans,
             render_plan_debug_dir=layout_output_dir,
             identity_debug_dir=layout_output_dir / "identity",
+            debug_images=args.debug_artifacts,
         )
         with fitz.open(pdf_path) as original:
             print_summary(pdf_path, rendered_path, original.page_count, render_stats)

@@ -11,6 +11,7 @@ from pdf_translator.translate import (
     load_translation_units,
     run_translation,
     sanitize_translation,
+    translation_output_token_limit,
     translate_batches,
     validate_response,
 )
@@ -37,8 +38,8 @@ class FakeClient:
         self.responses = iter(responses)
         self.calls = []
 
-    def chat_completion(self, messages, model):
-        self.calls.append((messages, model))
+    def chat_completion(self, messages, model, max_output_tokens):
+        self.calls.append((messages, model, max_output_tokens))
         return next(self.responses)
 
 
@@ -104,6 +105,7 @@ def test_invalid_json_retries_then_succeeds():
     result = translate_batches(UNITS, client, "mistral", batch_size=3, max_retries=1)
     assert [item["id"] for item in result] == [1, 2, 3]
     assert len(client.calls) == 2
+    assert client.calls[1][2] > client.calls[0][2]
 
 
 def test_multiple_batches_combine_and_preserve_ids():
@@ -113,6 +115,61 @@ def test_multiple_batches_combine_and_preserve_ids():
     assert len(client.calls) == 2
     sent = json.loads(client.calls[0][0][1]["content"])
     assert list(sent[0]) == ["id", "unit_type", "source"]
+
+
+def test_batches_are_bounded_by_unit_count_and_source_characters():
+    units = [
+        {"id": 1, "unit_type": "text", "source": "First text"},
+        {"id": 2, "unit_type": "text", "source": "Second text"},
+        {"id": 3, "unit_type": "text", "source": "Third text"},
+    ]
+    client = FakeClient([valid_response([unit]) for unit in units])
+
+    result = translate_batches(
+        units,
+        client,
+        "mistral",
+        batch_size=30,
+        max_retries=0,
+        max_batch_characters=12,
+    )
+
+    assert [item["id"] for item in result] == [1, 2, 3]
+    assert len(client.calls) == 3
+
+
+def test_translation_output_limit_scales_and_is_bounded():
+    assert translation_output_token_limit([{"source": "Short text"}]) == 512
+    assert translation_output_token_limit([{"source": "x" * 20_000}]) == 10000
+    assert translation_output_token_limit([{"source": "x" * 100_000}]) == 10000
+
+
+def test_translation_output_limit_includes_json_overhead_for_large_batch():
+    batch = [{"source": "Short translated field"} for _ in range(30)]
+
+    limit = translation_output_token_limit(batch)
+
+    assert 2000 <= limit < 10000
+
+
+def test_oversized_atomic_unit_is_isolated_from_other_batches():
+    units = [
+        {"id": 1, "unit_type": "text", "source": "Short"},
+        {"id": 2, "unit_type": "text", "source": "A single oversized source unit"},
+        {"id": 3, "unit_type": "text", "source": "Last"},
+    ]
+    client = FakeClient([valid_response([unit]) for unit in units])
+
+    translate_batches(
+        units,
+        client,
+        "mistral",
+        batch_size=30,
+        max_retries=0,
+        max_batch_characters=10,
+    )
+
+    assert len(client.calls) == 3
 
 
 def test_persistent_invalid_batch_raises():
@@ -225,9 +282,11 @@ def test_config_reads_environment(monkeypatch):
     monkeypatch.setenv("MODEL", "mistral")
     monkeypatch.setenv("TRANSLATION_BATCH_SIZE", "7")
     monkeypatch.setenv("TRANSLATION_MAX_RETRIES", "4")
+    monkeypatch.setenv("TRANSLATION_MAX_BATCH_CHARACTERS", "1234")
     config = TranslationConfig.from_environment()
     assert config.batch_size == 7
     assert config.max_retries == 4
+    assert config.max_batch_characters == 1234
 
 
 def test_run_translation_writes_separate_output_without_mutating_extraction(tmp_path: Path):

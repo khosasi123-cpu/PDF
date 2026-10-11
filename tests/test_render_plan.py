@@ -53,6 +53,20 @@ def test_paragraph_selects_reflow():
     assert strategy(result) == RenderingStrategy.REFLOW_REGION
 
 
+def test_missing_layout_units_use_one_aggregated_fallback_warning():
+    result = RenderPlanner().plan(
+        plan(),
+        {"units": [unit(1), unit(2, bbox=(90, 10, 160, 30))]},
+        {**translation(1), **translation(2)},
+        geometry(),
+    )
+
+    assert result.instruction_for_unit(1) is not None
+    assert result.instruction_for_unit(2) is not None
+    assert len(result.warnings) == 1
+    assert "omitted 2 units" in result.warnings[0]
+
+
 def test_structured_selects_structured_strategy():
     result = RenderPlanner().plan(
         plan(region("table", "reflow_region", unit_ids=[1])),

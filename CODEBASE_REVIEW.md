@@ -1,6 +1,6 @@
 # Codebase Review dan Session Handoff
 
-Tanggal review: 2026-10-05  
+Tanggal review: 2026-10-11
 Project root: `C:\Users\USER\Documents\KERJAAN\PDF\PDF`  
 Package: `pdf-translator` versi `0.1.0`  
 Runtime: Python `>=3.11`  
@@ -21,7 +21,7 @@ Prinsip arsitektur terpenting adalah model tidak boleh menghasilkan perintah dra
 
 Status verifikasi saat review:
 
-- `112` test lulus.
+- `126` test lulus.
 - `pip check` melaporkan tidak ada dependency yang rusak.
 - Tidak ada linting atau type checking yang dikonfigurasi.
 - Test integrasi dengan server LLM/vision nyata tidak dijalankan.
@@ -216,7 +216,7 @@ Rekomendasi:
 
 - Pemisahan antara rekomendasi model dan keputusan drawing sudah kuat.
 - `LayoutPlan` dan `RenderPlan` memakai Pydantic dengan `extra="forbid"`.
-- Geometri vision diganti dengan union source geometry saat source ID tersedia.
+- Compact vision references dipetakan kembali ke authoritative source geometry oleh Python.
 - Hash PDF, extraction, translation, dan layout mencegah sebagian besar cross-document misuse pada schema modern.
 - Translation response divalidasi berdasarkan ID dan source asli.
 - Terminology enforcement dilakukan lagi secara deterministik setelah output model.
@@ -396,9 +396,10 @@ Referensi: `src/pdf_translator/layout_analysis.py:51-198`, `src/pdf_translator/l
 
 - Membuat compact geometry untuk mengurangi prompt vision.
 - Mengirim PNG halaman dan geometry JSON ke endpoint vision.
-- Memvalidasi response sebagai `LayoutPlan`.
+- Memvalidasi compact semantic response, lalu Python membangun `LayoutPlan` dari unit/image references.
+- Menjalankan maksimal dua request halaman secara concurrent secara default.
 - Fallback jika client tidak tersedia, response invalid, confidence rendah, atau API gagal.
-- Menulis `page_NNN.json` dan debug PNG.
+- Menulis `page_NNN.json`; debug PNG hanya ditulis dengan `--debug-artifacts`.
 
 ### `render_plan.py`
 
@@ -458,7 +459,7 @@ Referensi: `src/pdf_translator/preview.py:8-28`, `src/pdf_translator/render_debu
 1. Setiap halaman diraster menjadi PNG skala `0.8`.
 2. Compact geometry dan PNG dikirim ke vision jika dikonfigurasi.
 3. Response divalidasi terhadap `LayoutPlan`.
-4. PDF source geometry menggantikan model bbox jika source IDs tersedia.
+4. Python membangun bbox dan source ownership dari unit IDs serta image indexes hasil vision.
 5. Jika vision gagal atau confidence `<0.6`, deterministic fallback dipakai.
 
 ### Fase 2: Translation
@@ -518,7 +519,8 @@ artifacts/documents/<pdf-stem>-<first-12-source-sha256>/
 | `LLM_BASE_URL` | Ya untuk translasi | tidak ada | OpenAI-compatible translation endpoint |
 | `OPENAI_API_KEY` | Ya untuk translasi | vision memakai `local-key` bila kosong | Credential client |
 | `MODEL` | Ya untuk translasi | tidak ada | Model translation |
-| `TRANSLATION_BATCH_SIZE` | Tidak | `20` | Unit representative per batch |
+| `TRANSLATION_BATCH_SIZE` | Tidak | `30` | Batas unit representative per batch |
+| `TRANSLATION_MAX_BATCH_CHARACTERS` | Tidak | `6000` | Batas karakter source per batch |
 | `TRANSLATION_MAX_RETRIES` | Tidak | `2` | Retry validation batch |
 | `VISION_MODEL` | Tidak | kosong | Mengaktifkan vision jika endpoint juga ada |
 | `VISION_BASE_URL` | Tidak | fallback ke `LLM_BASE_URL` | Vision endpoint |
@@ -594,7 +596,7 @@ Karena default path standalone masih legacy, gunakan path eksplisit:
 Hasil saat review:
 
 ```text
-112 passed in 1.23s
+126 passed in 1.14s
 No broken requirements found.
 ```
 
@@ -625,6 +627,18 @@ Test yang masih kurang:
 - Integrasi dengan server OpenAI-compatible translation dan vision nyata.
 - Fuzzing PDF malformed, sangat besar, encrypted, atau adversarial.
 
+## Optimisasi Performa yang Sudah Diterapkan
+
+- Vision output limit diturunkan menjadi `3000` token.
+- Vision memakai compact semantic response; bbox dan source ownership diselesaikan Python.
+- Vision page request berjalan dengan bounded concurrency default `2`, dapat diubah melalui `--vision-workers`.
+- Translation default batch menjadi maksimal `30` unit dan target `6000` source characters.
+- Translation output limit dihitung per batch, dengan ruang lebih besar hanya untuk atomic unit yang sangat panjang.
+- LayoutPlan, RenderPlan, dan identity JSON tetap ditulis pada full pipeline.
+- Diagnostic PNG dan identity overlays hanya ditulis dengan `--debug-artifacts`.
+- Cache lintas eksekusi belum diterapkan sesuai keputusan user.
+- Perilaku model loading/switching server belum diubah dan perlu diperiksa dari log server.
+
 ## Known Limitations
 
 - Tidak ada OCR untuk scanned PDF.
@@ -635,7 +649,7 @@ Test yang masih kurang:
 - Table detection bergantung pada visible PDF geometry.
 - Deteksi layout sengaja konservatif dan lebih memilih false negative.
 - Original text tetap ada di content stream di bawah visual mask.
-- Page rasterization dan identity/debug PNG dapat memakai disk dan memori besar.
+- Page rasterization dapat memakai memori besar; identity/debug PNG bersifat opt-in.
 - Correctness visual belum dapat dijamin hanya dari unit test berbasis text/geometry.
 
 ## Kondisi Worktree Saat Review
@@ -650,7 +664,7 @@ Test yang masih kurang:
 
 Perubahan code yang sudah ada dan bukan dibuat oleh review ini:
 
-- `layout_analysis.py`: `VISION_MAX_OUTPUT_TOKENS` berubah dari `3000` menjadi `10000`.
+- `layout_analysis.py`: output limit vision saat ini `3000`; compact response dan bounded concurrency sudah diterapkan setelah review awal.
 - `main.py`: penambahan pengukuran durasi translation dan total pipeline.
 - `.env`: modified; jangan tampilkan atau salin nilainya ke session/chat.
 
@@ -677,7 +691,7 @@ Project: Python PDF translator di C:\Users\USER\Documents\KERJAAN\PDF\PDF.
 
 Baca CODEBASE_REVIEW.md sebagai peta arsitektur dan hasil review terkini. Pipeline-nya adalah extraction -> semantic analysis -> optional vision LayoutPlan -> validated translation -> deterministic RenderPlan -> PyMuPDF overlay rendering. Vision hanya advisory; jangan izinkan model membuat code atau drawing command.
 
-Baseline terverifikasi: 112 pytest passed dan pip check bersih pada 2026-10-05.
+Baseline terverifikasi: 126 pytest passed dan pip check bersih pada 2026-10-11.
 
 Worktree sebelum CODEBASE_REVIEW.md dibuat sudah memiliki perubahan user pada .env, src/pdf_translator/layout_analysis.py, dan src/pdf_translator/main.py. Jangan revert perubahan tersebut. Jangan tampilkan isi .env.
 

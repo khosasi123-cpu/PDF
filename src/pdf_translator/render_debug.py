@@ -58,11 +58,17 @@ def save_layout_debug(
 
 
 def save_render_plan_debug(
-    source: fitz.Document, page_index: int, plan: RenderPlan, output_dir: Path
+    source: fitz.Document,
+    page_index: int,
+    plan: RenderPlan,
+    output_dir: Path,
+    write_debug_image: bool = True,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = f"page_{plan.page_number:03d}_render_plan"
     (output_dir / f"{stem}.json").write_text(plan.model_dump_json(indent=2), encoding="utf-8")
+    if not write_debug_image:
+        return
     debug, page = _debug_page(source, page_index)
     for index, instruction in enumerate(plan.regions):
         color = _COLORS[index % len(_COLORS)]

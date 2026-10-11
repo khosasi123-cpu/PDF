@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 from dotenv import load_dotenv
 import re
@@ -23,9 +24,13 @@ from .identity import payload_sha256
 LOGGER = logging.getLogger(__name__)
 DEFAULT_EXTRACTION_PATH = Path("artifacts/extraction/extraction.json")
 DEFAULT_OUTPUT_PATH = Path("artifacts/translation/translation.json")
-DEFAULT_BATCH_SIZE = 20
+DEFAULT_BATCH_SIZE = 30
+DEFAULT_MAX_BATCH_CHARACTERS = 6000
 DEFAULT_MAX_RETRIES = 2
+MIN_OUTPUT_TOKENS = 512
 MAX_OUTPUT_TOKENS = 10000
+JSON_OUTPUT_BASE_TOKENS = 256
+JSON_OUTPUT_TOKENS_PER_UNIT = 48
 
 SYSTEM_PROMPT = """You are a technical document translator.
 Translate English to professional technical Indonesian.
@@ -47,7 +52,12 @@ Do not output Chinese or commentary outside the JSON."""
 
 
 class TranslationClient(Protocol):
-    def chat_completion(self, messages: list[dict[str, str]], model: str) -> str:
+    def chat_completion(
+        self,
+        messages: list[dict[str, str]],
+        model: str,
+        max_output_tokens: int,
+    ) -> str:
         ...
 
 
@@ -79,6 +89,7 @@ class TranslationConfig:
     model: str
     batch_size: int = DEFAULT_BATCH_SIZE
     max_retries: int = DEFAULT_MAX_RETRIES
+    max_batch_characters: int = DEFAULT_MAX_BATCH_CHARACTERS
 
     @classmethod
     def from_environment(cls) -> TranslationConfig:
@@ -97,6 +108,9 @@ class TranslationConfig:
             model=model,
             batch_size=_positive_environment_int("TRANSLATION_BATCH_SIZE", DEFAULT_BATCH_SIZE),
             max_retries=_nonnegative_environment_int("TRANSLATION_MAX_RETRIES", DEFAULT_MAX_RETRIES),
+            max_batch_characters=_positive_environment_int(
+                "TRANSLATION_MAX_BATCH_CHARACTERS", DEFAULT_MAX_BATCH_CHARACTERS
+            ),
         )
 
 
@@ -297,6 +311,48 @@ def _translation_key(
     )
 
 
+def _bounded_batches(
+    units: list[dict[str, Any]],
+    batch_size: int,
+    max_batch_characters: int,
+) -> list[list[dict[str, Any]]]:
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_characters = 0
+    for unit in units:
+        source_characters = len(str(unit.get("source", "")))
+        if source_characters > max_batch_characters:
+            if current:
+                batches.append(current)
+                current = []
+                current_characters = 0
+            batches.append([unit])
+            continue
+        if current and (
+            len(current) >= batch_size
+            or current_characters + source_characters > max_batch_characters
+        ):
+            batches.append(current)
+            current = []
+            current_characters = 0
+        current.append(unit)
+        current_characters += source_characters
+    if current:
+        batches.append(current)
+    return batches
+
+
+def translation_output_token_limit(units: list[dict[str, Any]]) -> int:
+    source_characters = sum(len(str(unit.get("source", ""))) for unit in units)
+    estimated_source_tokens = math.ceil(source_characters / 3)
+    estimated_output_tokens = (
+        math.ceil(estimated_source_tokens * 1.5)
+        + len(units) * JSON_OUTPUT_TOKENS_PER_UNIT
+        + JSON_OUTPUT_BASE_TOKENS
+    )
+    return min(MAX_OUTPUT_TOKENS, max(MIN_OUTPUT_TOKENS, estimated_output_tokens))
+
+
 def _replace_corresponding_phrase(text: str, source: str, term: str, replacement: str) -> str:
     pattern = re.compile(rf"(?<!\w){re.escape(term)}(?!\w)", re.IGNORECASE)
     if pattern.search(text):
@@ -338,19 +394,19 @@ def translate_batches(
     warning_sink: list[dict[str, Any]] | None = None,
     source_language: str = "English",
     target_language: str = "Indonesian",
+    max_batch_characters: int = DEFAULT_MAX_BATCH_CHARACTERS,
 ) -> list[dict[str, Any]]:
     if batch_size < 1:
         raise TranslationError("batch_size must be at least 1")
+    if max_batch_characters < 1:
+        raise TranslationError("max_batch_characters must be at least 1")
 
     groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
     for unit in units:
         key = _translation_key(unit, dictionary, source_language, target_language)
         groups.setdefault(key, []).append(unit)
     representatives = [group[0] for group in groups.values()]
-    batches = [
-        representatives[index:index + batch_size]
-        for index in range(0, len(representatives), batch_size)
-    ]
+    batches = _bounded_batches(representatives, batch_size, max_batch_characters)
     representative_results: dict[int, dict[str, Any]] = {}
     source_fallback_ids: set[int] = set()
     warnings = warning_sink if warning_sink is not None else []
@@ -368,6 +424,7 @@ def translate_batches(
 
     for batch_number, batch in enumerate(batches, start=1):
         ids = [unit["id"] for unit in batch]
+        base_output_tokens = translation_output_token_limit(batch)
         print(f"Batch {batch_number}/{len(batches)}")
         print(f"IDs: {ids[0]}-{ids[-1]}")
 
@@ -384,7 +441,16 @@ def translate_batches(
                     )
 
             try:
-                response = client.chat_completion(messages_for(batch, correction), model)
+                output_tokens = min(
+                    MAX_OUTPUT_TOKENS,
+                    math.ceil(base_output_tokens * (1 + attempt * 0.5)),
+                )
+                print(f"Output token limit: {output_tokens}")
+                response = client.chat_completion(
+                    messages_for(batch, correction),
+                    model,
+                    output_tokens,
+                )
                 payload = extract_json_response(response)
                 validated = validate_response(payload, batch)
 
@@ -415,6 +481,7 @@ def translate_batches(
                                 f"only. Problems: {issue_summary}",
                             ),
                             model,
+                            translation_output_token_limit(retry_batch),
                         )
                         retry_validated = validate_response(
                             extract_json_response(retry_response), retry_batch
@@ -526,12 +593,17 @@ class OpenAITranslationClient:
             raise TranslationError("The openai package is required for translation") from error
         self.client = OpenAI(base_url=base_url, api_key=api_key)
 
-    def chat_completion(self, messages: list[dict[str, str]], model: str) -> str:
+    def chat_completion(
+        self,
+        messages: list[dict[str, str]],
+        model: str,
+        max_output_tokens: int,
+    ) -> str:
         response = self.client.responses.parse(
             model=model,
             input=messages,
             text_format=LLMResponse,
-            max_output_tokens=MAX_OUTPUT_TOKENS,
+            max_output_tokens=max_output_tokens,
             temperature=0,
         )
         parsed = response.output_parsed
@@ -567,7 +639,17 @@ def run_translation(
     print(f"Fixed translations: {len(dictionary.fixed_translation)}")
     print(f"Units skipped: {len(skipped)}")
     print(f"Batch size: {config.batch_size}")
-    print(f"Batches: {(len(translatable) + config.batch_size - 1) // config.batch_size}")
+    print(f"Maximum batch characters: {config.max_batch_characters}")
+    representative_units: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    for unit in translatable:
+        key = _translation_key(unit, dictionary, "English", "Indonesian")
+        representative_units.setdefault(key, unit)
+    planned_batches = _bounded_batches(
+        list(representative_units.values()),
+        config.batch_size,
+        config.max_batch_characters,
+    )
+    print(f"Batches: {len(planned_batches)}")
     print(f"Model: {config.model}")
     warnings: list[dict[str, Any]] = []
     translations = translate_batches(
@@ -578,6 +660,7 @@ def run_translation(
         config.max_retries,
         dictionary,
         warning_sink=warnings,
+        max_batch_characters=config.max_batch_characters,
     )
     translations = skipped_results + translations
 

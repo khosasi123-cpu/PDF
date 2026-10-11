@@ -1397,6 +1397,7 @@ def render_pdf(
     layout_plans: dict[int, LayoutPlan] | None = None,
     render_plan_debug_dir: Path | None = None,
     identity_debug_dir: Path | None = None,
+    debug_images: bool = False,
 ) -> tuple[Path, RenderStats]:
     extraction = _load_json(extraction_path)
     translation_payload = _load_json(translation_path)
@@ -1471,7 +1472,11 @@ def render_pdf(
                 from .render_debug import save_render_plan_debug
 
                 save_render_plan_debug(
-                    document, page_number - 1, render_plan, render_plan_debug_dir
+                    document,
+                    page_number - 1,
+                    render_plan,
+                    render_plan_debug_dir,
+                    write_debug_image=debug_images,
                 )
             primitives = RenderingPrimitives(page, obstacle_rects, filled_rects)
             region_by_id = {region.id: region for region in layout_plan.regions}
@@ -1659,8 +1664,12 @@ def render_pdf(
                             unit, structured_text, structured_spans, rect,
                             fallback_rect if structured_cell_fallback else None,
                         )
-                        stats.warnings.append(diagnostic)
-                        LOGGER.warning(diagnostic)
+                        if structured_cell_fallback or structured_fields is not None:
+                            visual_reason = "structured span mismatch used safe structured fallback"
+                            LOGGER.debug(diagnostic)
+                        else:
+                            stats.warnings.append(diagnostic)
+                            LOGGER.warning(diagnostic)
 
                 if structured_lines is not None:
                     rendered_rects = [item[0].render_rect for item in structured_lines]
@@ -2146,6 +2155,7 @@ def render_pdf(
             identity_debug_dir,
             extraction_path,
             translation_path,
+            write_debug_images=debug_images,
         )
     return output_path, stats
 
@@ -2177,12 +2187,19 @@ def main() -> int:
     parser.add_argument("--layout-dir", type=Path, default=None)
     parser.add_argument("--render-plan-debug-dir", type=Path, default=None)
     parser.add_argument("--identity-debug-dir", type=Path, default=None)
+    parser.add_argument(
+        "--debug-artifacts",
+        action="store_true",
+        help="Write diagnostic PNGs in addition to JSON artifacts",
+    )
     args = parser.parse_args()
     try:
         layout_plans = load_layout_plans(args.layout_dir) if args.layout_dir else None
         debug_dir = args.render_plan_debug_dir or args.layout_dir
+        if args.debug_artifacts and debug_dir is None:
+            debug_dir = DEFAULT_LAYOUT_DIR / args.pdf.stem
         identity_dir = args.identity_debug_dir or (
-            args.layout_dir / "identity" if args.layout_dir else None
+            debug_dir / "identity" if debug_dir is not None else None
         )
         output, stats = render_pdf(
             args.pdf,
@@ -2192,6 +2209,7 @@ def main() -> int:
             layout_plans=layout_plans,
             render_plan_debug_dir=debug_dir,
             identity_debug_dir=identity_dir,
+            debug_images=args.debug_artifacts,
         )
         with fitz.open(args.pdf) as original:
             print_summary(args.pdf, output, original.page_count, stats)

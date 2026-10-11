@@ -12,7 +12,7 @@ class RecordingClient:
         self.response = response
         self.calls = 0
 
-    def chat_completion(self, messages, model):
+    def chat_completion(self, messages, model, max_output_tokens):
         self.calls += 1
         return self.response
 

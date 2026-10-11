@@ -174,7 +174,7 @@ def test_multiline_table_cell_translation_is_rendered(tmp_path: Path):
     assert "Indonesian One Indonesian Two Indonesian Three 1" in fitz.open(output_path)[0].get_text()
 
 
-def test_table_cell_span_mismatch_uses_logged_logical_cell_fallback(tmp_path: Path):
+def test_table_cell_span_mismatch_uses_logical_cell_fallback_without_warning(tmp_path: Path):
     pdf_path = tmp_path / "source.pdf"
     document = fitz.open()
     page = document.new_page(width=200, height=100)
@@ -202,19 +202,17 @@ def test_table_cell_span_mismatch_uses_logged_logical_cell_fallback(tmp_path: Pa
         pdf_path, extraction_path, translation_path, tmp_path / "out.pdf",
         identity_debug_dir=identity_dir,
     )
-    warning = stats.warnings[0]
     identity = json.loads(
         (identity_dir / "render_identity.json").read_text(encoding="utf-8")
     )["units"][0]
 
     assert stats.rendered_units == 1
+    assert not stats.warnings
     assert "Terjemahan panjang" in fitz.open(output_path)[0].get_text()
-    assert all(field in warning for field in (
-        "Unit 1", "source=", "translation=", "span_count=2",
-        "translated_line_count=1", "source_span_bboxes=", "cell_bbox=",
-        "chosen_render_rects=",
-    ))
     assert identity["render_status"] == "rendered"
+    assert identity["visual_fallback_reason"] == (
+        "structured span mismatch used safe structured fallback"
+    )
     assert identity["final_source_ids"] == identity["source_ids"]
     x0, y0, x1, y1 = identity["final_bbox"]
     assert 20 <= x0 < x1 <= 180
@@ -918,6 +916,7 @@ def test_render_plan_debug_artifacts_are_written(tmp_path: Path):
         pdf_path, extraction_path, translation_path, tmp_path / "out.pdf",
         render_plan_debug_dir=debug_dir,
         identity_debug_dir=debug_dir / "identity",
+        debug_images=True,
     )
 
     payload = json.loads((debug_dir / "page_001_render_plan.json").read_text(encoding="utf-8"))
@@ -941,6 +940,25 @@ def test_render_plan_debug_artifacts_are_written(tmp_path: Path):
     assert len(identity["output_sha256"]) == 64
     assert (debug_dir / "identity" / "source_page_001_overlay.png").exists()
     assert (debug_dir / "identity" / "output_page_001_overlay.png").exists()
+
+
+def test_render_writes_json_but_skips_debug_pngs_by_default(tmp_path: Path):
+    pdf_path, extraction_path, translation_path = _make_inputs(tmp_path)
+    debug_dir = tmp_path / "layout"
+
+    render_pdf(
+        pdf_path,
+        extraction_path,
+        translation_path,
+        tmp_path / "out.pdf",
+        render_plan_debug_dir=debug_dir,
+        identity_debug_dir=debug_dir / "identity",
+    )
+
+    assert (debug_dir / "page_001_render_plan.json").exists()
+    assert (debug_dir / "identity" / "render_identity.json").exists()
+    assert not (debug_dir / "page_001_render_plan_debug.png").exists()
+    assert not (debug_dir / "identity" / "source_page_001.png").exists()
 
 
 def test_render_rejects_cross_document_artifacts(tmp_path: Path):

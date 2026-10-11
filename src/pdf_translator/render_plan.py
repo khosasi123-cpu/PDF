@@ -224,6 +224,7 @@ class RenderPlanner:
             if not region.child_ids and region.type not in _IMAGE_TYPES
         ]
         assigned: set[int] = set()
+        fallback_unit_ids: list[int] = []
         instructions: list[RenderInstruction] = []
         warnings = list(layout_plan.warnings)
 
@@ -279,13 +280,18 @@ class RenderPlanner:
                     recommended_strategy=RenderingStrategy.FALLBACK_ORIGINAL_BBOX,
                     unit_ids=[unit_id],
                 )
-                warnings.append(f"Unit {unit_id}: no LayoutPlan region; using original bbox")
+                fallback_unit_ids.append(unit_id)
             instruction = self._plan_unit(
                 layout_plan, region, unit, translations.get(unit_id), page_geometry
             )
             instructions.append(instruction)
             assigned.add(unit_id)
 
+        if fallback_unit_ids:
+            warnings.append(
+                f"LayoutPlan omitted {len(fallback_unit_ids)} units; "
+                f"deterministic original-bbox regions used: {fallback_unit_ids}"
+            )
         missing = set(units) - assigned
         if missing:
             warnings.append(f"Units without render instructions: {sorted(missing)}")
