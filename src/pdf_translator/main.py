@@ -17,10 +17,13 @@ from .layout_analysis import (
 from .preview import create_preview
 from .render import print_summary, render_pdf
 from .translate import (
-    DEFAULT_DICTIONARY_PATH,
-    DEFAULT_OUTPUT_PATH as DEFAULT_TRANSLATION_PATH,
+    DEFAULT_SOURCE_LANGUAGE,
+    DEFAULT_TARGET_LANGUAGE,
     TranslationError,
+    language_pair_key,
+    language_scoped_translation_path,
     run_translation,
+    validate_language_pair,
 )
 
 DEFAULT_EXTRACTION_PATH = Path("artifacts/extraction/extraction.json")
@@ -78,7 +81,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run extraction, translation, and PDF rendering.")
     parser.add_argument("pdf", type=Path, help="Input PDF path")
     parser.add_argument("--debug-assignments", action="store_true", help="Log text-to-table-cell assignments")
-    parser.add_argument("--dictionary", type=Path, default=DEFAULT_DICTIONARY_PATH)
+    parser.add_argument("--dictionary", type=Path, default=None)
+    parser.add_argument("--source-language", default=DEFAULT_SOURCE_LANGUAGE)
+    parser.add_argument("--target-language", default=DEFAULT_TARGET_LANGUAGE)
     parser.add_argument("--extraction-output", type=Path, default=None)
     parser.add_argument("--translation-output", type=Path, default=None)
     parser.add_argument("--rendered-output", type=Path, default=None)
@@ -95,15 +100,31 @@ def main() -> int:
         help="Write diagnostic PNGs in addition to JSON artifacts",
     )
     args = parser.parse_args()
+    try:
+        source_language, target_language = validate_language_pair(
+            args.source_language, args.target_language
+        )
+    except TranslationError as error:
+        parser.error(str(error))
     pdf_path = args.pdf.resolve()
     document_dir = (
         Path("artifacts/documents")
         / f"{pdf_path.stem}-{sha256_file(pdf_path)[:12]}"
     )
+    default_language_pair = (
+        source_language.casefold() == DEFAULT_SOURCE_LANGUAGE.casefold()
+        and target_language.casefold() == DEFAULT_TARGET_LANGUAGE.casefold()
+    )
+    language_pair = language_pair_key(source_language, target_language)
     extraction_output = args.extraction_output or document_dir / "extraction.json"
-    translation_output = args.translation_output or document_dir / "translation.json"
+    translation_output = args.translation_output or language_scoped_translation_path(
+        document_dir / "translation.json", source_language, target_language
+    )
     preview_output = document_dir / "preview.pdf"
-    rendered_output = args.rendered_output or document_dir / f"{pdf_path.stem}_id.pdf"
+    rendered_output = args.rendered_output or document_dir / (
+        f"{pdf_path.stem}_id.pdf" if default_language_pair
+        else f"{pdf_path.stem}_{language_pair}.pdf"
+    )
     if args.debug_assignments:
         logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(message)s")
 
@@ -140,6 +161,8 @@ def main() -> int:
             extraction_path=extraction_output,
             output_path=translation_output,
             dictionary_path=args.dictionary,
+            source_language=source_language,
+            target_language=target_language,
         )
 
         translation_duration = time.perf_counter() - translation_started_at
@@ -151,14 +174,18 @@ def main() -> int:
         )
 
         print("\nPHASE 3: Rendering")
+        render_artifact_dir = (
+            layout_output_dir
+            if default_language_pair else layout_output_dir / f"render_{language_pair}"
+        )
         rendered_path, render_stats = render_pdf(
             pdf_path,
             extraction_path=extraction_output,
             translation_path=translation_output,
             output_path=rendered_output,
             layout_plans=layout_plans,
-            render_plan_debug_dir=layout_output_dir,
-            identity_debug_dir=layout_output_dir / "identity",
+            render_plan_debug_dir=render_artifact_dir,
+            identity_debug_dir=render_artifact_dir / "identity",
             debug_images=args.debug_artifacts,
         )
         with fitz.open(pdf_path) as original:

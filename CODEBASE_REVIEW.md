@@ -11,7 +11,7 @@ Dokumen ini menjelaskan kondisi **worktree saat ini**, bukan hanya commit terakh
 
 ## Ringkasan
 
-Project ini adalah pipeline translasi PDF Inggris ke Indonesia dengan tiga tanggung jawab utama:
+Project ini adalah pipeline translasi PDF dengan pasangan bahasa yang dapat dipilih dan default English ke Indonesian, dengan tiga tanggung jawab utama:
 
 1. PyMuPDF mengekstrak teks, struktur, style, gambar, tabel, dan geometri sumber.
 2. Model lokal/OpenAI-compatible menerjemahkan teks dan, jika dikonfigurasi, memberi saran layout berbasis vision.
@@ -21,7 +21,7 @@ Prinsip arsitektur terpenting adalah model tidak boleh menghasilkan perintah dra
 
 Status verifikasi saat review:
 
-- `126` test lulus.
+- `130` test lulus.
 - `pip check` melaporkan tidak ada dependency yang rusak.
 - Tidak ada linting atau type checking yang dikonfigurasi.
 - Test integrasi dengan server LLM/vision nyata tidak dijalankan.
@@ -526,7 +526,7 @@ artifacts/documents/<pdf-stem>-<first-12-source-sha256>/
 | `VISION_BASE_URL` | Tidak | fallback ke `LLM_BASE_URL` | Vision endpoint |
 | `VISION_TIMEOUT_SECONDS` | Tidak | `300` | Timeout vision request |
 
-Bahasa source dan target saat ini hard-coded sebagai English ke Indonesian di `src/pdf_translator/translate.py:339-340` dan `src/pdf_translator/translate.py:511-512`.
+Bahasa source dan target dapat dipilih melalui `--source-language` dan `--target-language`; default tetap English ke Indonesian. Prompt, deduplication key, metadata translation, output filename, dan artifact scope mengikuti pasangan bahasa tersebut.
 
 ### Translation dictionary
 
@@ -596,7 +596,7 @@ Karena default path standalone masih legacy, gunakan path eksplisit:
 Hasil saat review:
 
 ```text
-126 passed in 1.14s
+130 passed in 1.12s
 No broken requirements found.
 ```
 
@@ -691,7 +691,7 @@ Project: Python PDF translator di C:\Users\USER\Documents\KERJAAN\PDF\PDF.
 
 Baca CODEBASE_REVIEW.md sebagai peta arsitektur dan hasil review terkini. Pipeline-nya adalah extraction -> semantic analysis -> optional vision LayoutPlan -> validated translation -> deterministic RenderPlan -> PyMuPDF overlay rendering. Vision hanya advisory; jangan izinkan model membuat code atau drawing command.
 
-Baseline terverifikasi: 126 pytest passed dan pip check bersih pada 2026-10-11.
+Baseline terverifikasi: 130 pytest passed dan pip check bersih pada 2026-10-11.
 
 Worktree sebelum CODEBASE_REVIEW.md dibuat sudah memiliki perubahan user pada .env, src/pdf_translator/layout_analysis.py, dan src/pdf_translator/main.py. Jangan revert perubahan tersebut. Jangan tampilkan isi .env.
 

@@ -7,10 +7,12 @@ import pytest
 from pdf_translator.layout import LayoutPlan
 from pdf_translator.identity import payload_sha256, sha256_file
 from pdf_translator.render import (
+    _default_rendered_output,
     _extracted_structured_spans,
     _flow_text_across_slots,
     _obstacle_free_row_slots,
     _plain_text,
+    _render_debug_directories,
     render_pdf,
 )
 
@@ -19,6 +21,39 @@ def test_symbol_normalization_preserves_normal_text():
     assert _plain_text("● Test") == "• Test"
     assert _plain_text("○ • –") == "○ • –"
     assert _plain_text("Normal text") == "Normal text"
+
+
+def test_default_rendered_output_is_scoped_by_nondefault_language_pair():
+    pdf_path = Path("document.pdf")
+
+    default_output = _default_rendered_output(pdf_path, {
+        "source_language": "English", "target_language": "Indonesian",
+    })
+    reverse_output = _default_rendered_output(pdf_path, {
+        "source_language": "Indonesian", "target_language": "English",
+    })
+
+    assert default_output.name == "document_id.pdf"
+    assert reverse_output.name.startswith("document_indonesian_to_english_")
+
+
+def test_nondefault_render_diagnostics_are_language_scoped():
+    layout_dir = Path("artifacts/layout/document")
+
+    debug_dir, identity_dir = _render_debug_directories(
+        Path("document.pdf"),
+        layout_dir,
+        None,
+        None,
+        False,
+        "Indonesian",
+        "English",
+    )
+
+    assert debug_dir is not None
+    assert debug_dir.parent == layout_dir
+    assert debug_dir.name.startswith("render_indonesian_to_english_")
+    assert identity_dir == debug_dir / "identity"
 
 
 def test_extracted_spans_keep_translation_unit_source_order(tmp_path: Path):

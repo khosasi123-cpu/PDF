@@ -28,6 +28,14 @@ from .identity import (
     validate_layout_identity,
     validate_source_ownership,
 )
+from .translate import (
+    DEFAULT_SOURCE_LANGUAGE,
+    DEFAULT_TARGET_LANGUAGE,
+    TranslationError,
+    language_pair_key,
+    language_scoped_translation_path,
+    validate_language_pair,
+)
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_EXTRACTION_PATH = Path("artifacts/extraction/extraction.json")
@@ -83,6 +91,53 @@ def _load_json(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise RuntimeError(f"Unable to read JSON '{path}': {error}") from error
+
+
+def _default_rendered_output(pdf_path: Path, translation: dict[str, Any]) -> Path:
+    source_language = translation.get("source_language")
+    target_language = translation.get("target_language")
+    if not isinstance(source_language, str) or not isinstance(target_language, str):
+        return DEFAULT_OUTPUT_DIR / f"{pdf_path.stem}_id.pdf"
+    try:
+        source_language, target_language = validate_language_pair(
+            source_language, target_language
+        )
+    except TranslationError as error:
+        raise RuntimeError(f"Invalid translation language metadata: {error}") from error
+    if (
+        source_language.casefold() == DEFAULT_SOURCE_LANGUAGE.casefold()
+        and target_language.casefold() == DEFAULT_TARGET_LANGUAGE.casefold()
+    ):
+        return DEFAULT_OUTPUT_DIR / f"{pdf_path.stem}_id.pdf"
+    return DEFAULT_OUTPUT_DIR / (
+        f"{pdf_path.stem}_{language_pair_key(source_language, target_language)}.pdf"
+    )
+
+
+def _render_debug_directories(
+    pdf_path: Path,
+    layout_dir: Path | None,
+    render_plan_dir: Path | None,
+    identity_dir: Path | None,
+    debug_artifacts: bool,
+    source_language: str,
+    target_language: str,
+) -> tuple[Path | None, Path | None]:
+    default_language_pair = (
+        source_language.casefold() == DEFAULT_SOURCE_LANGUAGE.casefold()
+        and target_language.casefold() == DEFAULT_TARGET_LANGUAGE.casefold()
+    )
+    pair_directory = f"render_{language_pair_key(source_language, target_language)}"
+    debug_dir = render_plan_dir
+    if debug_dir is None and layout_dir is not None:
+        debug_dir = layout_dir if default_language_pair else layout_dir / pair_directory
+    if debug_artifacts and debug_dir is None:
+        base_dir = DEFAULT_LAYOUT_DIR / pdf_path.stem
+        debug_dir = base_dir if default_language_pair else base_dir / pair_directory
+    resolved_identity_dir = identity_dir or (
+        debug_dir / "identity" if debug_dir is not None else None
+    )
+    return debug_dir, resolved_identity_dir
 
 
 def load_layout_plans(directory: Path) -> dict[int, LayoutPlan]:
@@ -1407,7 +1462,7 @@ def render_pdf(
     translation_sha256 = payload_sha256(translation_payload)
     translations = _translation_map(translation_payload)
     if output_path is None:
-        output_path = DEFAULT_OUTPUT_DIR / f"{pdf_path.stem}_id.pdf"
+        output_path = _default_rendered_output(pdf_path, translation_payload)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     stats = RenderStats()
@@ -2182,8 +2237,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Render validated translations over the original PDF.")
     parser.add_argument("pdf", type=Path)
     parser.add_argument("--extraction", type=Path, default=DEFAULT_EXTRACTION_PATH)
-    parser.add_argument("--translation", type=Path, default=DEFAULT_TRANSLATION_PATH)
+    parser.add_argument("--translation", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--source-language", default=DEFAULT_SOURCE_LANGUAGE)
+    parser.add_argument("--target-language", default=DEFAULT_TARGET_LANGUAGE)
     parser.add_argument("--layout-dir", type=Path, default=None)
     parser.add_argument("--render-plan-debug-dir", type=Path, default=None)
     parser.add_argument("--identity-debug-dir", type=Path, default=None)
@@ -2194,17 +2251,26 @@ def main() -> int:
     )
     args = parser.parse_args()
     try:
+        source_language, target_language = validate_language_pair(
+            args.source_language, args.target_language
+        )
+        translation_path = args.translation or language_scoped_translation_path(
+            DEFAULT_TRANSLATION_PATH, source_language, target_language
+        )
         layout_plans = load_layout_plans(args.layout_dir) if args.layout_dir else None
-        debug_dir = args.render_plan_debug_dir or args.layout_dir
-        if args.debug_artifacts and debug_dir is None:
-            debug_dir = DEFAULT_LAYOUT_DIR / args.pdf.stem
-        identity_dir = args.identity_debug_dir or (
-            debug_dir / "identity" if debug_dir is not None else None
+        debug_dir, identity_dir = _render_debug_directories(
+            args.pdf,
+            args.layout_dir,
+            args.render_plan_debug_dir,
+            args.identity_debug_dir,
+            args.debug_artifacts,
+            source_language,
+            target_language,
         )
         output, stats = render_pdf(
             args.pdf,
             args.extraction,
-            args.translation,
+            translation_path,
             args.output,
             layout_plans=layout_plans,
             render_plan_debug_dir=debug_dir,

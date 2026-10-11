@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -27,28 +28,78 @@ DEFAULT_OUTPUT_PATH = Path("artifacts/translation/translation.json")
 DEFAULT_BATCH_SIZE = 30
 DEFAULT_MAX_BATCH_CHARACTERS = 6000
 DEFAULT_MAX_RETRIES = 2
+DEFAULT_SOURCE_LANGUAGE = "English"
+DEFAULT_TARGET_LANGUAGE = "Indonesian"
 MIN_OUTPUT_TOKENS = 512
 MAX_OUTPUT_TOKENS = 10000
 JSON_OUTPUT_BASE_TOKENS = 256
 JSON_OUTPUT_TOKENS_PER_UNIT = 48
 
-SYSTEM_PROMPT = """You are a technical document translator.
-Translate English to professional technical Indonesian.
+def validate_language_pair(source_language: str, target_language: str) -> tuple[str, str]:
+    source = " ".join(source_language.split())
+    target = " ".join(target_language.split())
+    if not source or not target:
+        raise TranslationError("source and target languages must be non-empty")
+    if len(source) > 50 or len(target) > 50:
+        raise TranslationError("source and target language names must not exceed 50 characters")
+    if any(
+        not (character.isalnum() or character in " -_()")
+        for language in (source, target)
+        for character in language
+    ):
+        raise TranslationError(
+            "source and target language names contain unsupported characters"
+        )
+    if source.casefold() == target.casefold():
+        raise TranslationError("source and target languages must be different")
+    return source, target
+
+
+def language_pair_key(source_language: str, target_language: str) -> str:
+    source, target = validate_language_pair(source_language, target_language)
+
+    def slug(value: str) -> str:
+        result = "".join(
+            character.lower() if character.isalnum() else "_" for character in value
+        )
+        return result.strip("_") or "language"
+
+    digest = hashlib.sha256(f"{source}\0{target}".encode("utf-8")).hexdigest()[:16]
+    return f"{slug(source)}_to_{slug(target)}_{digest}"
+
+
+def language_scoped_translation_path(
+    base_path: Path, source_language: str, target_language: str
+) -> Path:
+    source, target = validate_language_pair(source_language, target_language)
+    if (
+        source.casefold() == DEFAULT_SOURCE_LANGUAGE.casefold()
+        and target.casefold() == DEFAULT_TARGET_LANGUAGE.casefold()
+    ):
+        return base_path
+    return base_path.with_name(
+        f"{base_path.stem}_{language_pair_key(source, target)}{base_path.suffix}"
+    )
+
+
+def _system_prompt(source_language: str, target_language: str) -> str:
+    return f"""You are a technical document translator.
+Translate {source_language} to professional technical {target_language}.
 Preserve meaning exactly. Do not summarize, explain, add, remove, or rewrite unnecessarily.
 Preserve technical terminology, acronyms, identifiers, product names, filenames, paths,
 IP addresses, numbers, units, parameter names, URLs, symbols, and code-like values.
 Do not translate part numbers, document IDs, URLs, or values that should remain unchanged.
 The input units are already logically grouped. Do not split, merge, create, or delete units.
 Return ONLY valid JSON in exactly this shape:
-{"translations":[{"id":1,"translation":"Indonesian translation"}]}
+{{"translations":[{{"id":1,"translation":"{target_language} translation"}}]}}
 Do not return a source field. The source text is an opaque immutable value supplied in the input JSON;
 the caller will associate it with the returned ID. Some source strings may intentionally end mid-sentence
 because the PDF extractor split adjacent blocks; never complete, normalize, or infer source text.
 Every input ID must appear exactly once.
-For normal English words and sentences, you MUST actually translate them to Indonesian.
+For normal {source_language} words and sentences, you MUST actually translate them to {target_language}.
 Do not copy the source text unchanged unless it is an acronym, identifier, product name, code-like value,
 or a term explicitly protected by the terminology context.
-Do not output Chinese or commentary outside the JSON."""
+Do not output commentary outside the JSON."""
 
 
 class TranslationClient(Protocol):
@@ -392,14 +443,18 @@ def translate_batches(
     batch_size: int = DEFAULT_BATCH_SIZE, max_retries: int = DEFAULT_MAX_RETRIES,
     dictionary: TranslationDictionary | None = None,
     warning_sink: list[dict[str, Any]] | None = None,
-    source_language: str = "English",
-    target_language: str = "Indonesian",
+    source_language: str = DEFAULT_SOURCE_LANGUAGE,
+    target_language: str = DEFAULT_TARGET_LANGUAGE,
     max_batch_characters: int = DEFAULT_MAX_BATCH_CHARACTERS,
 ) -> list[dict[str, Any]]:
     if batch_size < 1:
         raise TranslationError("batch_size must be at least 1")
     if max_batch_characters < 1:
         raise TranslationError("max_batch_characters must be at least 1")
+    source_language, target_language = validate_language_pair(
+        source_language, target_language
+    )
+    system_prompt = _system_prompt(source_language, target_language)
 
     groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
     for unit in units:
@@ -413,7 +468,7 @@ def translate_batches(
 
     def messages_for(batch: list[dict[str, Any]], correction: str | None = None) -> list[dict[str, str]]:
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": _request_payload(batch)},
         ]
         if dictionary is not None:
@@ -566,6 +621,8 @@ def translate_batches(
 def save_translation(
     output_path: Path, extraction_path: Path, extraction_payload: dict[str, Any],
     translations: list[dict[str, Any]], model: str,
+    source_language: str = DEFAULT_SOURCE_LANGUAGE,
+    target_language: str = DEFAULT_TARGET_LANGUAGE,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     modern_identity = isinstance(extraction_payload.get("source_sha256"), str)
@@ -575,8 +632,8 @@ def save_translation(
         "source_file": extraction_payload.get("source_file", extraction_path.name),
         "source_extraction": str(extraction_path),
         "source_extraction_sha256": payload_sha256(extraction_payload),
-        "source_language": "English",
-        "target_language": "Indonesian",
+        "source_language": source_language,
+        "target_language": target_language,
         "model": model,
         "translations": translations,
     }
@@ -617,13 +674,33 @@ def run_translation(
     output_path: Path = DEFAULT_OUTPUT_PATH,
     config: TranslationConfig | None = None,
     client: TranslationClient | None = None,
-    dictionary_path: Path = DEFAULT_DICTIONARY_PATH,
+    dictionary_path: Path | None = None,
+    source_language: str = DEFAULT_SOURCE_LANGUAGE,
+    target_language: str = DEFAULT_TARGET_LANGUAGE,
 ) -> Path:
+    source_language, target_language = validate_language_pair(
+        source_language, target_language
+    )
     config = config or TranslationConfig.from_environment()
-    dictionary = TranslationDictionary.load(dictionary_path)
+    if (
+        dictionary_path is None
+        and source_language.casefold() == DEFAULT_SOURCE_LANGUAGE.casefold()
+        and target_language.casefold() == DEFAULT_TARGET_LANGUAGE.casefold()
+    ):
+        dictionary_path = DEFAULT_DICTIONARY_PATH
+    dictionary = (
+        TranslationDictionary.load(dictionary_path)
+        if dictionary_path is not None else None
+    )
     extraction_payload, units = load_translation_units(extraction_path, dictionary)
-    skipped = [unit for unit in units if dictionary.skip_matches(unit["source"])]
-    translatable = [unit for unit in units if not dictionary.skip_matches(unit["source"])]
+    skipped = [
+        unit for unit in units
+        if dictionary is not None and dictionary.skip_matches(unit["source"])
+    ]
+    translatable = [
+        unit for unit in units
+        if dictionary is None or not dictionary.skip_matches(unit["source"])
+    ]
     skipped_results = [
         {"id": unit["id"], "source": unit["source"], "translation": unit["source"]}
         for unit in skipped
@@ -631,18 +708,20 @@ def run_translation(
     active_client = client or OpenAITranslationClient(config.base_url, config.api_key)
     print("Translation\n-----------")
     print(f"Input: {extraction_path}")
+    print(f"Language: {source_language} -> {target_language}")
     print(f"Units to translate: {len(translatable)}")
     print("\nTranslation Dictionary")
     print("----------------------")
-    print(f"Skip translation terms: {len(dictionary.skip_translation)}")
-    print(f"Keep English terms: {len(dictionary.keep_english)}")
-    print(f"Fixed translations: {len(dictionary.fixed_translation)}")
+    print(f"Dictionary: {dictionary_path if dictionary_path is not None else 'disabled'}")
+    print(f"Skip translation terms: {len(dictionary.skip_translation) if dictionary else 0}")
+    print(f"Keep English terms: {len(dictionary.keep_english) if dictionary else 0}")
+    print(f"Fixed translations: {len(dictionary.fixed_translation) if dictionary else 0}")
     print(f"Units skipped: {len(skipped)}")
     print(f"Batch size: {config.batch_size}")
     print(f"Maximum batch characters: {config.max_batch_characters}")
     representative_units: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
     for unit in translatable:
-        key = _translation_key(unit, dictionary, "English", "Indonesian")
+        key = _translation_key(unit, dictionary, source_language, target_language)
         representative_units.setdefault(key, unit)
     planned_batches = _bounded_batches(
         list(representative_units.values()),
@@ -660,6 +739,8 @@ def run_translation(
         config.max_retries,
         dictionary,
         warning_sink=warnings,
+        source_language=source_language,
+        target_language=target_language,
         max_batch_characters=config.max_batch_characters,
     )
     translations = skipped_results + translations
@@ -679,7 +760,15 @@ def run_translation(
     print(f"Expected translations: {len(units)}")
     print(f"Returned translations: {len(translations)}")
     print("Missing IDs: 0\nUnexpected IDs: 0\nDuplicate IDs: 0\nSource mismatches: 0")
-    save_translation(output_path, extraction_path, extraction_payload, translations, config.model)
+    save_translation(
+        output_path,
+        extraction_path,
+        extraction_payload,
+        translations,
+        config.model,
+        source_language,
+        target_language,
+    )
     print(f"\nOutput: {output_path}")
     return output_path
 
@@ -687,11 +776,25 @@ def run_translation(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Translate extracted PDF units using a local OpenAI-compatible model.")
     parser.add_argument("--input", type=Path, default=DEFAULT_EXTRACTION_PATH)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH)
-    parser.add_argument("--dictionary", type=Path, default=DEFAULT_DICTIONARY_PATH)
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--dictionary", type=Path, default=None)
+    parser.add_argument("--source-language", default=DEFAULT_SOURCE_LANGUAGE)
+    parser.add_argument("--target-language", default=DEFAULT_TARGET_LANGUAGE)
     args = parser.parse_args()
     try:
-        run_translation(args.input, args.output, dictionary_path=args.dictionary)
+        source_language, target_language = validate_language_pair(
+            args.source_language, args.target_language
+        )
+        output_path = args.output or language_scoped_translation_path(
+            DEFAULT_OUTPUT_PATH, source_language, target_language
+        )
+        run_translation(
+            args.input,
+            output_path,
+            dictionary_path=args.dictionary,
+            source_language=source_language,
+            target_language=target_language,
+        )
     except TranslationError as error:
         print(f"Translation failed: {error}", file=sys.stderr)
         return 2

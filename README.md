@@ -30,6 +30,16 @@ Run the entire pipeline from the project root with one command:
 
 This runs extraction, dictionary-aware translation, and rendering in order. It writes `extraction.json`, `preview.pdf`, `translation.json`, layout artifacts, and the final PDF under `artifacts/documents/<name>-<source-hash>/`. The source PDF is not overwritten. The local model server must already be running before this command.
 
+English to Indonesian remains the default. Select any explicit source and target language with:
+
+```powershell
+.\.venv\Scripts\python.exe -m pdf_translator.main data/input/test.pdf `
+  --source-language Indonesian `
+  --target-language English
+```
+
+For non-default language pairs, translation, final PDF, and render diagnostics use a readable language-pair key plus a short hash so separate directions cannot overwrite each other. The default English-to-Indonesian paths remain unchanged.
+
 Use the separate commands when rerunning only one stage:
 
 ```powershell
@@ -53,7 +63,9 @@ $env:TRANSLATION_MAX_RETRIES = "2"
 Run translation independently from extraction:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pdf_translator.translate
+.\.venv\Scripts\python.exe -m pdf_translator.translate `
+  --source-language English `
+  --target-language Indonesian
 ```
 
 It reads `artifacts/extraction/extraction.json`, sends only units with `translate: true`, validates every batch ID and exact source string, and writes `artifacts/translation/translation.json`. Extraction JSON remains read-only. No PDF rendering is performed in Phase 2.
@@ -68,12 +80,22 @@ Edit [config/translation_dictionary.json](config/translation_dictionary.json) to
 
 The dictionary is validated for duplicate category conflicts. Longer phrases are matched before shorter phrases with word-boundary-aware matching. Run the same translation command again after editing the dictionary, then render as usual.
 
+The repository dictionary is enabled automatically only for the default English-to-Indonesian pair. Other language pairs run without it unless `--dictionary PATH` is supplied explicitly, preventing Indonesian fixed terms from being applied to another target language.
+
 ## Rendering
 
 Render the validated translation without running extraction or translation again:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pdf_translator.render data/input/test.pdf
+```
+
+When rendering a standalone non-default translation without explicit artifact paths, pass the same pair so the language-scoped translation file is selected:
+
+```powershell
+.\.venv\Scripts\python.exe -m pdf_translator.render data/input/test.pdf `
+  --source-language Indonesian `
+  --target-language English
 ```
 
 The output is `artifacts/rendered/test_id.pdf`. The renderer uses the original PDF as its base and does not call the LLM.

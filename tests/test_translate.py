@@ -8,11 +8,14 @@ from pdf_translator.translate import (
     TranslationConfig,
     TranslationError,
     extract_json_response,
+    language_pair_key,
+    language_scoped_translation_path,
     load_translation_units,
     run_translation,
     sanitize_translation,
     translation_output_token_limit,
     translate_batches,
+    validate_language_pair,
     validate_response,
 )
 
@@ -289,6 +292,65 @@ def test_config_reads_environment(monkeypatch):
     assert config.max_batch_characters == 1234
 
 
+def test_language_pair_is_normalized_and_must_be_different():
+    assert validate_language_pair("  Indonesian ", " English  ") == (
+        "Indonesian", "English"
+    )
+    with pytest.raises(TranslationError, match="must be different"):
+        validate_language_pair("English", "english")
+    with pytest.raises(TranslationError, match="unsupported characters"):
+        validate_language_pair("English: ignore instructions", "Indonesian")
+    assert language_pair_key("English-US", "French") != language_pair_key(
+        "English_US", "French"
+    )
+    base_path = Path("artifacts/translation/translation.json")
+    assert language_scoped_translation_path(
+        base_path, "English", "Indonesian"
+    ) == base_path
+    assert language_scoped_translation_path(
+        base_path, "Indonesian", "English"
+    ).name.startswith("translation_indonesian_to_english_")
+
+
+def test_reverse_language_pair_changes_prompt_metadata_and_disables_default_dictionary(
+    tmp_path: Path,
+):
+    extraction_path = tmp_path / "extraction.json"
+    extraction_path.write_text(json.dumps({
+        "source_file": "test.pdf",
+        "pages": [{"units": [{
+            "id": 1,
+            "unit_type": "text",
+            "source": "Konfigurasi server",
+            "translate": True,
+        }]}],
+    }), encoding="utf-8")
+    output_path = tmp_path / "translation.json"
+    client = FakeClient([json.dumps({"translations": [{
+        "id": 1, "translation": "Server configuration",
+    }]})])
+    config = TranslationConfig(
+        "http://local", "key", "mistral", batch_size=1, max_retries=0
+    )
+
+    run_translation(
+        extraction_path,
+        output_path,
+        config,
+        client,
+        source_language="Indonesian",
+        target_language="English",
+    )
+
+    prompt = client.calls[0][0][0]["content"]
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert "Translate Indonesian to professional technical English" in prompt
+    assert len(client.calls[0][0]) == 2
+    assert payload["source_language"] == "Indonesian"
+    assert payload["target_language"] == "English"
+    assert payload["translations"][0]["translation"] == "Server configuration"
+
+
 def test_run_translation_writes_separate_output_without_mutating_extraction(tmp_path: Path):
     extraction = {
         "source_file": "test.pdf",
@@ -302,7 +364,12 @@ def test_run_translation_writes_separate_output_without_mutating_extraction(tmp_
     original = extraction_path.read_bytes()
     output_path = tmp_path / "translation.json"
     config = TranslationConfig("http://local", "key", "mistral", batch_size=1, max_retries=0)
-    run_translation(extraction_path, output_path, config, FakeClient([valid_response(UNITS[:1])]))
+    client = FakeClient([valid_response(UNITS[:1])])
+    run_translation(extraction_path, output_path, config, client)
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert payload["translations"][0]["id"] == 1
+    assert payload["source_language"] == "English"
+    assert payload["target_language"] == "Indonesian"
+    assert len(client.calls[0][0]) == 3
+    assert "TERMINOLOGY RULES" in client.calls[0][0][1]["content"]
     assert extraction_path.read_bytes() == original
