@@ -205,5 +205,193 @@ def main() -> int:
         return 2
 
 
+
+def translate_pdf(
+    input_pdf: str | Path,
+    output_dir: str | Path,
+    source_language: str = DEFAULT_SOURCE_LANGUAGE,
+    target_language: str = DEFAULT_TARGET_LANGUAGE,
+    dictionary_path: str | Path | None = None,
+    vision_workers: int = DEFAULT_VISION_WORKERS,
+    debug_assignments: bool = False,
+    debug_artifacts: bool = False,
+) -> Path:
+
+    pdf_path = Path(input_pdf).resolve()
+    document_dir = Path(output_dir).resolve()
+
+    if not pdf_path.is_file():
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+    if not isinstance(vision_workers, int) or isinstance(vision_workers, bool) or vision_workers < 1:
+        raise ValueError("vision_workers must be a positive integer")
+
+    source_language, target_language = validate_language_pair(
+        source_language,
+        target_language,
+    )
+
+    document_dir.mkdir(parents=True, exist_ok=True)
+
+    extraction_output = document_dir / "extraction.json"
+    translation_output = language_scoped_translation_path(
+        document_dir / "translation.json",
+        source_language,
+        target_language,
+    )
+    preview_output = document_dir / "preview.pdf"
+    rendered_output = document_dir / "output.pdf"
+    layout_output_dir = document_dir / "layout"
+
+    default_language_pair = (
+        source_language.casefold() == DEFAULT_SOURCE_LANGUAGE.casefold()
+        and target_language.casefold() == DEFAULT_TARGET_LANGUAGE.casefold()
+    )
+
+    language_pair = language_pair_key(
+        source_language,
+        target_language,
+    )
+
+    if debug_assignments:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(levelname)s %(message)s",
+        )
+
+    pipeline_started_at = time.perf_counter()
+
+    # --------------------------------------------------
+    # PHASE 1: Extraction
+    # --------------------------------------------------
+
+    print("PHASE 1: Extraction")
+
+    result = extract_pdf(
+        pdf_path,
+        debug_assignments=debug_assignments,
+    )
+
+    save_extraction(result, extraction_output)
+
+    create_preview(
+        pdf_path,
+        preview_output,
+        result,
+    )
+
+    _print_summary(pdf_path, result)
+
+    print(f"Extraction JSON: {extraction_output}")
+    print(f"Preview PDF: {preview_output}")
+
+    # --------------------------------------------------
+    # PHASE 1.5: Layout Analysis
+    # --------------------------------------------------
+
+    print("\nPHASE 1.5: Adaptive layout analysis")
+
+    layout_plans = analyze_document_layout(
+        pdf_path,
+        result.to_dict(),
+        layout_output_dir,
+        client=OpenAIMinistralVisionClient.from_environment(),
+        max_workers=vision_workers,
+        write_debug_images=debug_artifacts,
+    )
+
+    vision_pages = sum(
+        plan.source == "vision"
+        for plan in layout_plans.values()
+    )
+
+    print(f"Layout plans: {layout_output_dir}")
+    print(
+        f"Vision analyzed pages: "
+        f"{vision_pages}/{len(layout_plans)}"
+    )
+
+    # --------------------------------------------------
+    # PHASE 2: Translation
+    # --------------------------------------------------
+
+    print("\nPHASE 2: Translation")
+
+    translation_started_at = time.perf_counter()
+
+    run_translation(
+        extraction_path=extraction_output,
+        output_path=translation_output,
+        dictionary_path=(
+            Path(dictionary_path).resolve()
+            if dictionary_path is not None
+            else None
+        ),
+        source_language=source_language,
+        target_language=target_language,
+    )
+
+    translation_duration = (
+        time.perf_counter() - translation_started_at
+    )
+
+    translation_minutes, translation_seconds = divmod(
+        translation_duration, 60
+    )
+
+    print(
+        f"Translation duration: "
+        f"{int(translation_minutes)}m "
+        f"{translation_seconds:.2f}s "
+        f"({translation_duration:.2f} seconds)"
+    )
+
+    # --------------------------------------------------
+    # PHASE 3: Rendering
+    # --------------------------------------------------
+
+    print("\nPHASE 3: Rendering")
+
+    render_artifact_dir = (
+        layout_output_dir
+        if default_language_pair
+        else layout_output_dir / f"render_{language_pair}"
+    )
+
+    rendered_path, render_stats = render_pdf(
+        pdf_path,
+        extraction_path=extraction_output,
+        translation_path=translation_output,
+        output_path=rendered_output,
+        layout_plans=layout_plans,
+        render_plan_debug_dir=render_artifact_dir,
+        identity_debug_dir=render_artifact_dir / "identity",
+        debug_images=debug_artifacts,
+    )
+
+    with fitz.open(pdf_path) as original:
+        print_summary(
+            pdf_path,
+            rendered_path,
+            original.page_count,
+            render_stats,
+        )
+
+    pipeline_duration = (
+        time.perf_counter() - pipeline_started_at
+    )
+
+    pipeline_minutes, pipeline_seconds = divmod(
+        pipeline_duration, 60
+    )
+
+    print(
+        f"\nTotal pipeline duration: "
+        f"{int(pipeline_minutes)}m "
+        f"{pipeline_seconds:.2f}s "
+        f"({pipeline_duration:.2f} seconds)"
+    )
+
+    return Path(rendered_path)
 if __name__ == "__main__":
     raise SystemExit(main())
