@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any, Callable, Iterable
 
 import fitz
@@ -13,6 +14,7 @@ MIN_FONT_SIZE = 5.5
 STRUCTURED_MIN_FONT_SIZE = 4.5
 GAP = 0.75
 MODEL_CONFIDENCE_THRESHOLD = 0.6
+MIN_FONT_RATIO = 0.75
 
 
 class RenderInstruction(BaseModel):
@@ -83,6 +85,8 @@ def _bbox(value: Any) -> BBox | None:
         result = tuple(float(coordinate) for coordinate in value)
     except (TypeError, ValueError):
         return None
+    if not all(math.isfinite(coordinate) for coordinate in result):
+        return None
     if result[2] <= result[0] or result[3] <= result[1]:
         return None
     return result  # type: ignore[return-value]
@@ -108,6 +112,12 @@ def _contains(container: BBox, inner: BBox, tolerance: float = 1.0) -> bool:
 
 def _area(bbox: BBox) -> float:
     return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+
+
+def _intersection_area(a: BBox, b: BBox) -> float:
+    return max(0.0, min(a[2], b[2]) - max(a[0], b[0])) * max(
+        0.0, min(a[3], b[3]) - max(a[1], b[1])
+    )
 
 
 def _center_in(bbox: BBox, region: BBox) -> bool:
@@ -171,15 +181,15 @@ def safe_expansion_candidates(
     obstacles: Iterable[BBox],
 ) -> list[BBox]:
     """Return collision-free rightward/downward candidates within bounds."""
-    relevant = [other for other in obstacles if other != bbox and not _contains(other, bbox)]
+    relevant = [other for other in obstacles if other != bbox]
     right = bounds[2]
     for other in relevant:
-        if other[0] >= bbox[2] and other[3] > bbox[1] and other[1] < bbox[3]:
-            right = min(right, other[0] - GAP)
+        if other[2] > bbox[2] and other[3] > bbox[1] and other[1] < bbox[3]:
+            right = min(right, max(bbox[2], other[0] - GAP))
     downward = bounds[3]
     for other in relevant:
-        if other[1] >= bbox[3] and other[2] > bbox[0] and other[0] < bbox[2]:
-            downward = min(downward, other[1] - GAP)
+        if other[3] > bbox[3] and other[2] > bbox[0] and other[0] < bbox[2]:
+            downward = min(downward, max(bbox[3], other[1] - GAP))
 
     candidates: list[BBox] = []
     if right > bbox[2] + GAP:
@@ -189,7 +199,10 @@ def safe_expansion_candidates(
     return [
         candidate for candidate in candidates
         if _contains(bounds, candidate, tolerance=0.0)
-        and not any(_overlaps(candidate, other) and not _overlaps(bbox, other) for other in relevant)
+        and not any(
+            _intersection_area(candidate, other) > _intersection_area(bbox, other) + 1e-6
+            for other in relevant
+        )
     ]
 
 
@@ -214,10 +227,15 @@ class RenderPlanner:
         translations: dict[int, dict[str, Any]],
         page_geometry: PageGeometry,
     ) -> RenderPlan:
-        units = {
+        parsed_units = {
             unit["id"]: unit
             for unit in extraction.get("units", [])
             if isinstance(unit.get("id"), int) and _bbox(unit.get("bbox")) is not None
+        }
+        units = {
+            unit_id: unit
+            for unit_id, unit in parsed_units.items()
+            if _contains(page_geometry.page_bbox, _bbox(unit["bbox"]), tolerance=0.0)
         }
         leaf_regions = [
             region for region in layout_plan.regions
@@ -227,6 +245,11 @@ class RenderPlanner:
         fallback_unit_ids: list[int] = []
         instructions: list[RenderInstruction] = []
         warnings = list(layout_plan.warnings)
+        outside_page = sorted(set(parsed_units) - set(units))
+        if outside_page:
+            warnings.append(
+                f"Units outside page bounds were preserved without render instructions: {outside_page}"
+            )
 
         for region in sorted(layout_plan.regions, key=lambda item: item.reading_order):
             if region.type in _IMAGE_TYPES:
@@ -321,8 +344,20 @@ class RenderPlanner:
         assert original is not None
         text = str((translation_item or {}).get("translation", unit.get("source", "")))
         fontsize = max(float(unit.get("fontsize", 10.0)), 1.0)
-        minimum = STRUCTURED_MIN_FONT_SIZE if unit.get("unit_type") == "table_cell" else MIN_FONT_SIZE
+        absolute_minimum = (
+            STRUCTURED_MIN_FONT_SIZE
+            if unit.get("unit_type") == "table_cell"
+            else MIN_FONT_SIZE
+        )
+        minimum = max(absolute_minimum, fontsize * MIN_FONT_RATIO)
         recommendation_trusted = region.confidence >= self.confidence_threshold
+
+        if any(_overlaps(original, image) for image in geometry.image_obstacles):
+            return self._instruction(
+                region, unit, RenderingStrategy.FALLBACK_ORIGINAL_BBOX, original, original,
+                "source text overlaps an image, so masking or replacement is unsafe",
+                fixed=True,
+            )
 
         if unit.get("unit_type") in {"table_cell", "borderless_structured"} or region.type in _STRUCTURED_TYPES:
             return self._instruction(
@@ -368,13 +403,6 @@ class RenderPlanner:
             return self._instruction(
                 region, unit, RenderingStrategy.FALLBACK_ORIGINAL_BBOX, original, original,
                 "fixed header, footer, or TOC geometry cannot expand outside its source band",
-                fixed=True,
-            )
-
-        if any(_overlaps(original, image) for image in geometry.image_obstacles):
-            return self._instruction(
-                region, unit, RenderingStrategy.FALLBACK_ORIGINAL_BBOX, original, original,
-                "source text overlaps an image, so covering or expansion outside its bbox is unsafe",
                 fixed=True,
             )
 

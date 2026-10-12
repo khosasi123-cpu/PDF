@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
+import math
 from typing import Any, Iterable
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -81,6 +82,8 @@ class LayoutRegion(BaseModel):
     @field_validator("bbox")
     @classmethod
     def validate_bbox(cls, bbox: BBox | None) -> BBox | None:
+        if bbox is not None and not all(math.isfinite(value) for value in bbox):
+            raise ValueError("bbox coordinates must be finite")
         return bbox
 
     @field_validator("page_number_anchor")
@@ -89,6 +92,8 @@ class LayoutRegion(BaseModel):
         if bbox is None:
             return None
         x0, y0, x1, y1 = bbox
+        if not all(math.isfinite(value) for value in bbox):
+            raise ValueError("bbox coordinates must be finite")
         if x0 < 0 or y0 < 0 or x1 <= x0 or y1 <= y0:
             raise ValueError("bbox must have non-negative coordinates and positive area")
         return bbox
@@ -153,6 +158,8 @@ def _valid_bbox(value: Any) -> BBox | None:
         bbox = tuple(float(coordinate) for coordinate in value)
     except (TypeError, ValueError):
         return None
+    if not all(math.isfinite(coordinate) for coordinate in bbox):
+        return None
     if bbox[0] < 0 or bbox[1] < 0 or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
         return None
     return bbox  # type: ignore[return-value]
@@ -210,6 +217,10 @@ def resolve_layout_plan_geometry(
         if boxes:
             region.model_bbox = region.bbox
             region.bbox = _union(boxes)
+            if region.bbox[2] > plan.width or region.bbox[3] > plan.height:
+                raise ValueError(
+                    f"region {region.id!r} resolved PDF geometry is outside the page"
+                )
             region.geometry_source = GeometrySource.PDF
             if derived_unit_ids:
                 region.unit_ids = sorted(derived_unit_ids)
@@ -223,6 +234,10 @@ def resolve_layout_plan_geometry(
         if child_boxes and not region.source_ids and not region.unit_ids:
             region.model_bbox = region.bbox
             region.bbox = _union(child_boxes)
+            if region.bbox[2] > plan.width or region.bbox[3] > plan.height:
+                raise ValueError(
+                    f"region {region.id!r} resolved child geometry is outside the page"
+                )
             region.geometry_source = GeometrySource.PDF
     return LayoutPlan.model_validate(resolved.model_dump())
 
@@ -315,7 +330,19 @@ def fallback_layout_plan(
         if source.get("kind") == "image" and _valid_bbox(source.get("bbox")) is not None
     ]
     image_values = [(_valid_bbox(source["bbox"]), source.get("id")) for source in source_images]
-    image_values.extend((bbox, None) for bbox in image_bboxes if not source_images)
+    known_images = {
+        tuple(round(coordinate, 3) for coordinate in bbox)
+        for bbox, _ in image_values
+        if bbox is not None
+    }
+    for raw_bbox in image_bboxes:
+        bbox = _valid_bbox(raw_bbox)
+        if bbox is None:
+            continue
+        key = tuple(round(coordinate, 3) for coordinate in bbox)
+        if key not in known_images:
+            known_images.add(key)
+            image_values.append((bbox, None))
     for index, (bbox, source_id) in enumerate(image_values, start=1):
         if bbox is None:
             continue

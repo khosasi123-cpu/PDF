@@ -67,12 +67,42 @@ def test_missing_layout_units_use_one_aggregated_fallback_warning():
     assert "omitted 2 units" in result.warnings[0]
 
 
+def test_unit_outside_page_gets_no_unsafe_render_instruction():
+    result = RenderPlanner().plan(
+        plan(),
+        {"units": [unit(1, bbox=(190, 10, 220, 30))]},
+        translation(),
+        geometry(),
+    )
+
+    assert result.instruction_for_unit(1) is None
+    assert any("outside page bounds" in warning for warning in result.warnings)
+
+
 def test_structured_selects_structured_strategy():
     result = RenderPlanner().plan(
         plan(region("table", "reflow_region", unit_ids=[1])),
         {"units": [unit(unit_type="table_cell")]}, translation(), geometry(),
     )
     assert strategy(result) == RenderingStrategy.STRUCTURED_REGION
+
+
+def test_structured_source_overlapping_image_is_preserved():
+    result = RenderPlanner().plan(
+        plan(region("table", "structured_region", unit_ids=[1])),
+        {"units": [unit(unit_type="table_cell")]},
+        translation(),
+        PageGeometry(
+            page_bbox=(0, 0, 200, 100),
+            image_obstacles=((20, 10, 60, 30),),
+            fit_checker=lambda *_: True,
+        ),
+    )
+
+    instruction = result.instruction_for_unit(1)
+    assert instruction.strategy == RenderingStrategy.FALLBACK_ORIGINAL_BBOX
+    assert instruction.source_geometry_fixed is True
+    assert "image" in instruction.reason
 
 
 def test_multicolumn_leaf_selects_multicolumn_strategy():
@@ -132,6 +162,30 @@ def test_collision_detection_stops_before_neighbor():
     assert (10, 10, 59.25, 20) in candidates
     assert (10, 10, 40, 39.25) in candidates
     assert all(candidate[2] <= 60 or candidate[3] <= 40 for candidate in candidates)
+
+
+def test_expansion_never_increases_overlap_with_existing_obstacle():
+    source = (10, 10, 40, 20)
+
+    candidates = safe_expansion_candidates(
+        source,
+        (0, 0, 200, 100),
+        [(30, 10, 100, 20), (10, 15, 40, 80), (20, 5, 35, 25)],
+    )
+
+    assert candidates == []
+
+
+def test_diagonal_neighbor_does_not_block_independent_safe_expansion():
+    candidates = safe_expansion_candidates(
+        (10, 10, 40, 20),
+        (0, 0, 200, 100),
+        [(50, 30, 100, 80)],
+    )
+
+    assert (10, 10, 200, 20) in candidates
+    assert (10, 10, 40, 100) in candidates
+    assert all(not (candidate[2] > 50 and candidate[3] > 30) for candidate in candidates)
 
 
 def test_multiple_strategies_coexist_on_one_page():

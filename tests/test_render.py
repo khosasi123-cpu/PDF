@@ -3,6 +3,7 @@ from pathlib import Path
 
 import fitz
 import pytest
+import pdf_translator.render as render_module
 
 from pdf_translator.layout import LayoutPlan
 from pdf_translator.identity import payload_sha256, sha256_file
@@ -13,6 +14,7 @@ from pdf_translator.render import (
     _obstacle_free_row_slots,
     _plain_text,
     _render_debug_directories,
+    _validate_page_source_ownership,
     render_pdf,
 )
 
@@ -613,6 +615,58 @@ def test_text_cover_does_not_erase_inline_vector_graphic(tmp_path: Path):
     assert pixel[0] > 200 and pixel[1] < 50 and pixel[2] < 50
 
 
+def test_structured_span_rendering_preserves_source_near_graphic_obstacle(tmp_path: Path):
+    pdf_path = tmp_path / "source.pdf"
+    document = fitz.open()
+    page = document.new_page(width=200, height=90)
+    page.insert_text((20, 28), "First", fontsize=8)
+    page.insert_text((20, 48), "Second", fontsize=8)
+    page.draw_rect(
+        fitz.Rect(40, 14, 180, 58), color=(1, 0, 0), fill=(1, 0, 0)
+    )
+    document.save(pdf_path)
+    document.close()
+    extraction_path = tmp_path / "extraction.json"
+    extraction_path.write_text(json.dumps({
+        "pages": [{
+            "page_number": 1,
+            "source_objects": [
+                {"id": "first", "kind": "span", "bbox": [20, 20, 40, 30],
+                 "text": "First", "metadata": {"origin": [20, 28]}},
+                {"id": "second", "kind": "span", "bbox": [20, 40, 48, 50],
+                 "text": "Second", "metadata": {"origin": [20, 48]}},
+            ],
+            "units": [{
+                "id": 1, "unit_type": "table_cell", "source": "First\nSecond",
+                "bbox": [15, 12, 180, 60], "fontsize": 8, "flags": 0,
+                "line_count": 2, "translate": True,
+                "source_ids": ["first", "second"],
+            }],
+        }],
+    }), encoding="utf-8")
+    translation_path = tmp_path / "translation.json"
+    translation_path.write_text(json.dumps({"translations": [{
+        "id": 1, "source": "First\nSecond", "translation": "Pertama\nKedua",
+    }]}), encoding="utf-8")
+    identity_dir = tmp_path / "identity"
+
+    output_path, _ = render_pdf(
+        pdf_path, extraction_path, translation_path, tmp_path / "out.pdf",
+        identity_debug_dir=identity_dir,
+    )
+    output = fitz.open(output_path)
+    identity = json.loads(
+        (identity_dir / "render_identity.json").read_text(encoding="utf-8")
+    )["units"][0]
+
+    assert "First" in output[0].get_text()
+    assert "Pertama" not in output[0].get_text()
+    red = output[0].get_pixmap(alpha=False).pixel(90, 24)
+    assert red[0] > 200 and red[1] < 50 and red[2] < 50
+    assert identity["fallback_reason"] == "graphic_collision"
+    assert identity["mask_rectangles"] == []
+
+
 def test_single_line_uses_source_baseline_without_textbox_shrink(tmp_path: Path):
     pdf_path = tmp_path / "source.pdf"
     document = fitz.open()
@@ -694,10 +748,10 @@ def test_overflow_below_typography_floor_preserves_source_without_masking(tmp_pa
     assert identity["render_status"] == "source_fallback"
     assert identity["font_size_ratio"] == 1
     assert identity["mask_rectangles"] == []
-    assert identity["fallback_reason"] == "typography_floor"
+    assert identity["fallback_reason"] == "font_size_below_threshold"
 
 
-def test_fixed_heading_retries_collision_free_local_expansion(tmp_path: Path):
+def test_fixed_heading_does_not_expand_beyond_render_plan(tmp_path: Path):
     pdf_path = tmp_path / "source.pdf"
     document = fitz.open()
     page = document.new_page(width=200, height=80)
@@ -746,12 +800,12 @@ def test_fixed_heading_retries_collision_free_local_expansion(tmp_path: Path):
         (identity_dir / "render_identity.json").read_text(encoding="utf-8")
     )["units"][0]
     assert stats.rendered_units == 1
-    assert "Petunjuk" in fitz.open(output_path)[0].get_text()
-    assert identity["render_status"] == "rendered"
-    assert identity["font_size_ratio"] >= 0.75
-    assert identity["visual_fallback_reason"] == (
-        "translation expanded into collision-free local space"
-    )
+    output_text = fitz.open(output_path)[0].get_text()
+    assert "Hint" in output_text
+    assert "Petunjuk" not in output_text
+    assert identity["render_status"] == "source_fallback"
+    assert identity["mask_rectangles"] == []
+    assert identity["fallback_reason"] == "font_size_below_threshold"
 
 
 def test_structured_span_mismatch_preserves_source_composition(tmp_path: Path):
@@ -1045,6 +1099,45 @@ def test_render_rejects_translation_from_stale_extraction(tmp_path: Path):
         render_pdf(pdf_path, extraction_path, translation_path, tmp_path / "out.pdf")
 
 
+def test_schema_three_without_owned_spans_preserves_source(tmp_path: Path):
+    pdf_path, extraction_path, translation_path = _make_inputs(tmp_path)
+    extraction = json.loads(extraction_path.read_text(encoding="utf-8"))
+    extraction.update({
+        "schema_version": 3,
+        "artifact_type": "extraction",
+        "source_file": pdf_path.name,
+        "source_sha256": sha256_file(pdf_path),
+    })
+    extraction_path.write_text(json.dumps(extraction), encoding="utf-8")
+    translation = json.loads(translation_path.read_text(encoding="utf-8"))
+    translation.update({
+        "schema_version": 2,
+        "artifact_type": "translation",
+        "source_file": pdf_path.name,
+        "source_sha256": sha256_file(pdf_path),
+        "source_extraction_sha256": payload_sha256(extraction),
+    })
+    translation_path.write_text(json.dumps(translation), encoding="utf-8")
+    identity_dir = tmp_path / "identity"
+
+    output_path, _ = render_pdf(
+        pdf_path,
+        extraction_path,
+        translation_path,
+        tmp_path / "out.pdf",
+        identity_debug_dir=identity_dir,
+    )
+    identity = json.loads(
+        (identity_dir / "render_identity.json").read_text(encoding="utf-8")
+    )["units"][0]
+
+    assert "Hello" in fitz.open(output_path)[0].get_text()
+    assert "Halo" not in fitz.open(output_path)[0].get_text()
+    assert identity["render_status"] == "source_fallback"
+    assert identity["fallback_reason"] == "unsafe_mask"
+    assert identity["mask_rectangles"] == []
+
+
 def test_render_rejects_layout_plan_from_another_document(tmp_path: Path):
     pdf_path, extraction_path, translation_path = _make_inputs(tmp_path)
     extraction = json.loads(extraction_path.read_text(encoding="utf-8"))
@@ -1131,7 +1224,7 @@ def test_private_use_glyph_preserves_original_visual_unit(tmp_path: Path):
     assert any("private-use glyph preserved" in warning for warning in stats.warnings)
 
 
-def test_toc_title_wrap_keeps_page_number_anchor_and_regenerates_leader(tmp_path: Path):
+def test_unsafe_toc_wrap_preserves_title_page_number_and_leader(tmp_path: Path):
     pdf_path = tmp_path / "source.pdf"
     document = fitz.open()
     page = document.new_page(width=220, height=100)
@@ -1171,4 +1264,232 @@ def test_toc_title_wrap_keeps_page_number_anchor_and_regenerates_leader(tmp_path
     assert stats.rendered_units == 1
     assert any(span["text"] == "49" and round(span["bbox"][0]) == 185 for span in spans)
     assert "." in output_page.get_text()
-    assert "Judul" in output_page.get_text()
+    assert "Short title" in output_page.get_text()
+    assert "Judul" not in output_page.get_text()
+
+
+def test_owned_span_mask_covers_source_without_erasing_neighbor_or_rule(tmp_path: Path):
+    pdf_path = tmp_path / "source.pdf"
+    document = fitz.open()
+    page = document.new_page(width=220, height=80)
+    page.insert_text((20, 30), "ORIGINAL", fontsize=11, color=(1, 0, 0))
+    page.insert_text((140, 30), "NEIGHBOR", fontsize=11, color=(1, 0, 0))
+    page.draw_line((10, 40), (210, 40), color=(0, 0, 0), width=1)
+    spans = [
+        span for block in page.get_text("dict")["blocks"] if block.get("type") == 0
+        for line in block.get("lines", []) for span in line.get("spans", [])
+    ]
+    source_bbox = next(span["bbox"] for span in spans if span["text"] == "ORIGINAL")
+    neighbor_bbox = next(span["bbox"] for span in spans if span["text"] == "NEIGHBOR")
+    document.save(pdf_path)
+    document.close()
+    extraction_path = tmp_path / "extraction.json"
+    extraction_path.write_text(json.dumps({
+        "pages": [{
+            "page_number": 1,
+            "source_objects": [{
+                "id": "source-span", "kind": "span", "bbox": list(source_bbox),
+                "text": "ORIGINAL", "metadata": {"origin": [20, 30]},
+            }],
+            "units": [{
+                "id": 1, "unit_type": "text", "source": "ORIGINAL",
+                "bbox": list(source_bbox), "fontsize": 11, "flags": 0,
+                "line_count": 1, "translate": True, "source_ids": ["source-span"],
+            }],
+        }],
+    }), encoding="utf-8")
+    translation_path = tmp_path / "translation.json"
+    translation_path.write_text(json.dumps({
+        "translations": [{"id": 1, "source": "ORIGINAL", "translation": "BARU"}],
+    }), encoding="utf-8")
+
+    output_path, _ = render_pdf(
+        pdf_path, extraction_path, translation_path, tmp_path / "out.pdf"
+    )
+    output_page = fitz.open(output_path)[0]
+    pixmap = output_page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+
+    def red_pixels(bbox):
+        rect = fitz.Rect(bbox) * fitz.Matrix(2, 2)
+        count = 0
+        for y in range(max(0, int(rect.y0)), min(pixmap.height, int(rect.y1) + 1)):
+            for x in range(max(0, int(rect.x0)), min(pixmap.width, int(rect.x1) + 1)):
+                red, green, blue = pixmap.pixel(x, y)[:3]
+                count += red > 180 and green < 100 and blue < 100
+        return count
+
+    assert red_pixels(source_bbox) == 0
+    assert red_pixels(neighbor_bbox) > 10
+    rule_pixel = pixmap.pixel(200, 80)
+    assert max(rule_pixel[:3]) < 80
+
+
+@pytest.mark.parametrize(
+    "translation",
+    [
+        "A very long translated sentence that cannot safely fit beside the image",
+        "Café panjang yang tidak dapat ditempatkan dengan aman di samping gambar",
+    ],
+)
+def test_image_blocks_ascii_and_unicode_expansion(tmp_path: Path, translation: str):
+    pdf_path = tmp_path / "source.pdf"
+    document = fitz.open()
+    page = document.new_page(width=140, height=80)
+    page.insert_text((20, 28), "Short", fontsize=9)
+    image = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 20, 20), False)
+    for y in range(20):
+        for x in range(20):
+            image.set_pixel(x, y, (0, 255, 0))
+    page.insert_image(fitz.Rect(55, 12, 90, 35), pixmap=image)
+    page.insert_text((20, 50), "Neighbor paragraph blocks downward growth", fontsize=8)
+    source_bbox = next(
+        span["bbox"] for block in page.get_text("dict")["blocks"]
+        if block.get("type") == 0 for line in block.get("lines", [])
+        for span in line.get("spans", []) if span["text"] == "Short"
+    )
+    document.save(pdf_path)
+    document.close()
+    extraction_path = tmp_path / "extraction.json"
+    extraction_path.write_text(json.dumps({
+        "pages": [{"page_number": 1, "source_objects": [{
+            "id": "span", "kind": "span", "bbox": list(source_bbox),
+            "text": "Short", "metadata": {"origin": [20, 28]},
+        }], "units": [
+            {"id": 1, "unit_type": "text", "source": "Short",
+             "bbox": list(source_bbox), "fontsize": 9, "flags": 0,
+             "line_count": 1, "translate": True, "source_ids": ["span"]},
+            {"id": 2, "unit_type": "text",
+             "source": "Neighbor paragraph blocks downward growth",
+             "bbox": [20, 40, 135, 53], "fontsize": 8, "flags": 0,
+             "line_count": 1, "translate": False},
+        ]}],
+    }), encoding="utf-8")
+    translation_path = tmp_path / "translation.json"
+    translation_path.write_text(json.dumps({"translations": [{
+        "id": 1, "source": "Short", "translation": translation,
+    }]}), encoding="utf-8")
+    identity_dir = tmp_path / "identity"
+
+    output_path, _ = render_pdf(
+        pdf_path, extraction_path, translation_path, tmp_path / "out.pdf",
+        identity_debug_dir=identity_dir,
+    )
+    output = fitz.open(output_path)
+    identity = json.loads(
+        (identity_dir / "render_identity.json").read_text(encoding="utf-8")
+    )["units"][0]
+
+    assert "Short" in output[0].get_text()
+    assert translation.split()[0] not in output[0].get_text()
+    green = output[0].get_pixmap(alpha=False).pixel(70, 20)
+    assert green[1] > 200 and green[0] < 50 and green[2] < 50
+    assert identity["mask_rectangles"] == []
+    assert identity["render_status"] == "source_fallback"
+
+
+def test_transformed_text_direction_falls_back_without_masking(tmp_path: Path):
+    pdf_path, extraction_path, translation_path = _make_inputs(tmp_path)
+    extraction = json.loads(extraction_path.read_text(encoding="utf-8"))
+    extraction["pages"][0]["units"][0]["direction"] = [0, -1]
+    extraction_path.write_text(json.dumps(extraction), encoding="utf-8")
+    identity_dir = tmp_path / "identity"
+
+    output_path, _ = render_pdf(
+        pdf_path, extraction_path, translation_path, tmp_path / "out.pdf",
+        identity_debug_dir=identity_dir,
+    )
+    identity = json.loads(
+        (identity_dir / "render_identity.json").read_text(encoding="utf-8")
+    )["units"][0]
+
+    assert "Hello" in fitz.open(output_path)[0].get_text()
+    assert "Halo" not in fitz.open(output_path)[0].get_text()
+    assert identity["mask_rectangles"] == []
+    assert identity["fallback_reason"] == "unsupported_text_direction"
+
+
+def test_translated_unit_cannot_mask_span_also_owned_by_skipped_unit():
+    page_data = {
+        "source_objects": [{
+            "id": "shared", "kind": "span", "bbox": [10, 10, 40, 20],
+            "unit_ids": [1, 2],
+        }],
+        "units": [
+            {"id": 1, "translate": True, "source_ids": ["shared"]},
+            {"id": 2, "translate": False, "source_ids": ["shared"]},
+        ],
+    }
+
+    with pytest.raises(RuntimeError, match="Duplicate translated source-span ownership"):
+        _validate_page_source_ownership(page_data)
+
+
+def test_translated_unit_requires_reciprocal_source_owner_declaration():
+    page_data = {
+        "source_objects": [{
+            "id": "span", "kind": "span", "bbox": [10, 10, 40, 20],
+            "unit_ids": [],
+        }],
+        "units": [{
+            "id": 1, "translate": True, "source_ids": ["span"],
+        }],
+    }
+
+    with pytest.raises(RuntimeError, match="does not declare this owner"):
+        _validate_page_source_ownership(page_data)
+
+
+def test_toc_leader_mask_requires_toc_entry_authorization():
+    page_data = {
+        "source_objects": [
+            {"id": "title", "kind": "span", "bbox": [10, 10, 40, 20],
+             "unit_ids": [1]},
+            {"id": "unrelated", "kind": "span", "bbox": [50, 10, 90, 20],
+             "unit_ids": []},
+        ],
+        "toc_entries": [],
+        "units": [{
+            "id": 1,
+            "translate": True,
+            "source_ids": ["title"],
+            "metadata": {"toc_leader_source_ids": ["unrelated"]},
+        }],
+    }
+
+    with pytest.raises(RuntimeError, match="unauthorized TOC leader"):
+        _validate_page_source_ownership(page_data)
+
+
+@pytest.mark.parametrize("existing_output", [False, True])
+def test_render_failure_never_publishes_partial_pdf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing_output: bool
+):
+    pdf_path, extraction_path, translation_path = _make_inputs(tmp_path)
+    output_path = tmp_path / "out.pdf"
+    original_output = None
+    if existing_output:
+        valid = fitz.open()
+        valid.new_page(width=50, height=50).insert_text((10, 20), "Existing")
+        valid.save(output_path)
+        valid.close()
+        original_output = output_path.read_bytes()
+    real_validator = render_module.validate_source_ownership
+
+    def fail_on_second_unit(unit, instruction):
+        real_validator(unit, instruction)
+        if unit.get("id") == 2:
+            raise RuntimeError("injected render failure")
+
+    monkeypatch.setattr(render_module, "validate_source_ownership", fail_on_second_unit)
+
+    with pytest.raises(RuntimeError, match="injected render failure"):
+        render_pdf(pdf_path, extraction_path, translation_path, output_path)
+
+    if existing_output:
+        assert output_path.read_bytes() == original_output
+        with fitz.open(output_path) as output:
+            assert output.page_count == 1
+            assert "Existing" in output[0].get_text()
+    else:
+        assert not output_path.exists()
+    assert list(tmp_path.glob(".out.pdf.*.tmp")) == []

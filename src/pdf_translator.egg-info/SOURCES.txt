@@ -4,10 +4,16 @@ src/pdf_translator/__init__.py
 src/pdf_translator/dictionary.py
 src/pdf_translator/extractor.py
 src/pdf_translator/filters.py
+src/pdf_translator/identity.py
+src/pdf_translator/layout.py
+src/pdf_translator/layout_analysis.py
 src/pdf_translator/main.py
 src/pdf_translator/models.py
 src/pdf_translator/preview.py
 src/pdf_translator/render.py
+src/pdf_translator/render_debug.py
+src/pdf_translator/render_plan.py
+src/pdf_translator/semantics.py
 src/pdf_translator/translate.py
 src/pdf_translator.egg-info/PKG-INFO
 src/pdf_translator.egg-info/SOURCES.txt
@@ -17,5 +23,9 @@ src/pdf_translator.egg-info/top_level.txt
 tests/test_dictionary.py
 tests/test_extractor.py
 tests/test_filters.py
+tests/test_layout.py
+tests/test_layout_analysis.py
 tests/test_render.py
+tests/test_render_plan.py
+tests/test_semantics.py
 tests/test_translate.py

@@ -1,7 +1,12 @@
 import pytest
 from pydantic import ValidationError
 
-from pdf_translator.layout import GeometrySource, LayoutPlan, resolve_layout_plan_geometry
+from pdf_translator.layout import (
+    GeometrySource,
+    LayoutPlan,
+    fallback_layout_plan,
+    resolve_layout_plan_geometry,
+)
 
 
 def valid_plan():
@@ -93,3 +98,69 @@ def test_unknown_source_id_is_rejected_during_resolution():
             "page_number": 1, "width": 200, "height": 100,
             "units": [], "source_objects": [],
         })
+
+
+def test_resolved_source_geometry_outside_page_is_rejected():
+    payload = valid_plan()
+    payload["regions"][0].update({
+        "bbox": None,
+        "source_ids": ["span"],
+        "unit_ids": [],
+    })
+
+    with pytest.raises(ValueError, match="outside the page"):
+        resolve_layout_plan_geometry(LayoutPlan.model_validate(payload), {
+            "page_number": 1,
+            "width": 200,
+            "height": 100,
+            "units": [],
+            "source_objects": [{
+                "id": "span", "kind": "span", "bbox": [190, 10, 220, 20],
+            }],
+        })
+
+
+def test_nonfinite_source_geometry_is_rejected():
+    payload = valid_plan()
+    payload["regions"][0].update({
+        "bbox": None,
+        "source_ids": ["span"],
+        "unit_ids": [],
+    })
+
+    with pytest.raises(ValueError, match="unknown source IDs"):
+        resolve_layout_plan_geometry(LayoutPlan.model_validate(payload), {
+            "page_number": 1,
+            "width": 200,
+            "height": 100,
+            "units": [],
+            "source_objects": [{
+                "id": "span", "kind": "span", "bbox": [10, 10, float("nan"), 20],
+            }],
+        })
+
+
+def test_nonfinite_direct_layout_bbox_is_rejected():
+    payload = valid_plan()
+    payload["regions"][0]["bbox"] = [10, 10, float("nan"), 20]
+
+    with pytest.raises(ValidationError, match="finite"):
+        LayoutPlan.model_validate(payload)
+
+
+def test_fallback_layout_merges_extracted_and_additional_images():
+    result = fallback_layout_plan({
+        "page_number": 1,
+        "width": 200,
+        "height": 100,
+        "units": [],
+        "source_objects": [{
+            "id": "image-1", "kind": "image", "bbox": [10, 10, 30, 30],
+        }],
+    }, image_bboxes=[(10, 10, 30, 30), (50, 10, 80, 40)])
+
+    images = [region for region in result.regions if region.type.value == "image"]
+    assert [region.bbox for region in images] == [
+        (10.0, 10.0, 30.0, 30.0),
+        (50.0, 10.0, 80.0, 40.0),
+    ]

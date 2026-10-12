@@ -1,6 +1,9 @@
 import json
 from pathlib import Path
 
+import fitz
+import pytest
+
 from pdf_translator.extractor import block_to_unit, detect_table_regions, extract_page_units, extract_pdf, save_extraction
 
 
@@ -47,6 +50,30 @@ def test_block_reconstruction_metadata_and_one_based_page_number():
     assert unit.fontname == "Arial-Bold"
     assert unit.fontsize == 12
     assert unit.flags == 16
+
+
+@pytest.mark.parametrize("rotation", [90, 180, 270])
+def test_rotated_page_uses_unrotated_extraction_dimensions(tmp_path: Path, rotation: int):
+    pdf_path = tmp_path / f"rotated-{rotation}.pdf"
+    document = fitz.open()
+    page = document.new_page(width=200, height=100)
+    page.insert_text((150, 30), "Edge")
+    page.set_rotation(rotation)
+    document.save(pdf_path)
+    document.close()
+
+    result = extract_pdf(pdf_path)
+    extracted_page = result.pages[0]
+
+    assert extracted_page.width == 200
+    assert extracted_page.height == 100
+    assert extracted_page.rotation == rotation
+    assert [unit.source for unit in extracted_page.units] == ["Edge"]
+    assert all(
+        0 <= coordinate <= limit
+        for unit in extracted_page.units
+        for coordinate, limit in zip(unit.bbox, (200, 100, 200, 100))
+    )
 
 
 def test_multiple_lines_and_bbox_union():

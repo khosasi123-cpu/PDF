@@ -86,8 +86,12 @@ def validate_layout_identity(
 
 
 def validate_source_ownership(unit: dict[str, Any], instruction: RenderInstruction) -> None:
-    unit_ids = tuple(sorted(set(unit.get("source_ids", []))))
-    instruction_ids = tuple(sorted(set(instruction.source_ids)))
+    unit_ids = tuple(unit.get("source_ids", []))
+    instruction_ids = tuple(instruction.source_ids)
+    if len(unit_ids) != len(set(unit_ids)):
+        raise RuntimeError(
+            f"Unit {unit.get('id')}: duplicate source ownership IDs: {unit_ids!r}"
+        )
     if unit_ids != instruction_ids:
         raise RuntimeError(
             f"Unit {unit.get('id')}: source ownership mismatch; "
@@ -167,14 +171,38 @@ def _overlay_page(
 ) -> None:
     original = source[page_index]
     debug = fitz.open()
-    page = debug.new_page(width=original.rect.width, height=original.rect.height)
-    page.show_pdf_page(page.rect, source, page_index)
+    debug.insert_pdf(source, from_page=page_index, to_page=page_index)
+    page = debug[0]
     for record in records:
         bbox = record.get(bbox_key)
         if not isinstance(bbox, list) or len(bbox) != 4:
             continue
         rect = fitz.Rect(bbox)
-        page.draw_rect(rect, color=(0.9, 0.1, 0.1), width=1.0, overlay=True)
+        color = (0.1, 0.35, 0.9) if bbox_key == "final_bbox" else (0.9, 0.1, 0.1)
+        if bbox_key == "final_bbox":
+            for obstacle in record.get("detected_visual_obstacles", []):
+                page.draw_rect(
+                    fitz.Rect(obstacle),
+                    color=(0.75, 0.1, 0.75),
+                    width=1.0,
+                    overlay=True,
+                )
+            for mask in record.get("mask_rectangles", []):
+                page.draw_rect(
+                    fitz.Rect(mask),
+                    color=(0.95, 0.45, 0.05),
+                    width=1.0,
+                    overlay=True,
+                )
+            safe_bbox = record.get("safe_render_bbox")
+            if isinstance(safe_bbox, list) and len(safe_bbox) == 4:
+                page.draw_rect(
+                    fitz.Rect(safe_bbox),
+                    color=(0.05, 0.65, 0.25),
+                    width=1.0,
+                    overlay=True,
+                )
+        page.draw_rect(rect, color=color, width=1.0, overlay=True)
         source_ids = ",".join(record.get("final_source_ids", [])[:2]) or "none"
         label = (
             f"U{record['translation_unit']} src={source_ids}\n"
@@ -184,8 +212,8 @@ def _overlay_page(
         label_rect = fitz.Rect(
             rect.x0, max(0, rect.y0 - 16), min(page.rect.x1, rect.x0 + 280), rect.y0
         )
-        page.draw_rect(label_rect, color=(0.9, 0.1, 0.1), fill=(1, 1, 1), width=0.4)
-        page.insert_textbox(label_rect, label, fontsize=5.5, color=(0.8, 0.0, 0.0))
+        page.draw_rect(label_rect, color=color, fill=(1, 1, 1), width=0.4)
+        page.insert_textbox(label_rect, label, fontsize=5.5, color=color)
     debug[0].get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False).save(output_path)
     debug.close()
 

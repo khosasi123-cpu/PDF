@@ -18,11 +18,13 @@ _COLORS = (
 
 
 def _debug_page(source: fitz.Document, page_index: int) -> tuple[fitz.Document, fitz.Page]:
-    source_page = source[page_index]
     debug = fitz.open()
-    page = debug.new_page(width=source_page.rect.width, height=source_page.rect.height)
-    page.show_pdf_page(page.rect, source, page_index)
-    return debug, page
+    debug.insert_pdf(source, from_page=page_index, to_page=page_index)
+    return debug, debug[0]
+
+
+def _display_rect(source_page: fitz.Page, bbox: object) -> fitz.Rect:
+    return fitz.Rect(bbox)
 
 
 def _write_png(document: fitz.Document, path: Path) -> None:
@@ -35,9 +37,10 @@ def save_layout_debug(
     source: fitz.Document, page_index: int, plan: LayoutPlan, output_path: Path
 ) -> None:
     debug, page = _debug_page(source, page_index)
+    source_page = source[page_index]
     for index, region in enumerate(plan.regions):
         color = _COLORS[index % len(_COLORS)]
-        rect = fitz.Rect(region.bbox)
+        rect = _display_rect(source_page, region.bbox)
         page.draw_rect(rect, color=color, width=1.2, overlay=True)
         label = (
             f"{region.id} | {region.type.value} | {region.recommended_strategy.value} | "
@@ -70,9 +73,10 @@ def save_render_plan_debug(
     if not write_debug_image:
         return
     debug, page = _debug_page(source, page_index)
+    source_page = source[page_index]
     for index, instruction in enumerate(plan.regions):
         color = _COLORS[index % len(_COLORS)]
-        rect = fitz.Rect(instruction.bbox)
+        rect = _display_rect(source_page, instruction.bbox)
         page.draw_rect(rect, color=color, width=1.2, overlay=True)
         label = (
             f"{instruction.region_id} | {instruction.strategy.value} | "

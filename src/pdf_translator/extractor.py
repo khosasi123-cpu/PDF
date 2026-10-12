@@ -387,7 +387,8 @@ def _has_vertical_overlap(
 def _column_ordered_blocks(page: Any, blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Order genuine two-column segments left-to-right without moving
     full-width separators into either column."""
-    page_width = float(page.rect.width)
+    page_box = getattr(page, "cropbox", page.rect)
+    page_width = float(page_box.width)
     midpoint = page_width / 2
 
     def side(block: dict[str, Any]) -> str:
@@ -667,8 +668,8 @@ def extract_pdf(pdf_path: Path, debug_assignments: bool = False) -> ExtractionRe
             ambiguous_assignments += ambiguous
             pages.append(PageExtraction(
                 page_number=page_index + 1,
-                width=float(page.rect.width),
-                height=float(page.rect.height),
+                width=float(page.cropbox.width),
+                height=float(page.cropbox.height),
                 rotation=int(page.rotation),
                 units=units,
                 source_objects=source_objects,

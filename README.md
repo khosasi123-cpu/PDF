@@ -139,13 +139,16 @@ Pages without extractable text are reported and processing continues. OCR is not
 .\.venv\Scripts\python.exe -m pytest
 ```
 
+Rendering is conservative: executable text geometry is bounded by the validated RenderPlan, image/vector collisions apply to native and HTML text paths, and unsafe units preserve their source visuals. Final PDFs are saved to a temporary sibling, reopened and page-count validated, then atomically published. `--debug-artifacts` adds overlays for source/target geometry, masks, and protected visual obstacles.
+
 ## Known limitations
 
 - No OCR.
 - No image inpainting or replacement of text embedded in images.
 - No semantic sentence detection.
 - No semantic block merging outside detected table cells.
-- Overlay rendering leaves the original text in the PDF content stream, while covering it visually with white rectangles.
+- Overlay rendering leaves original text in the PDF content stream. Owned source spans are covered visually using a sampled or vector-fill background color; no PDF redaction is performed.
+- Arbitrarily rotated or transformed text is preserved rather than replaced; direction-aware text rendering is not implemented.
 - Line-end hyphenation such as `config-` / `uration` is not normalized.
 - Table boundaries come from visible PDF geometry; ordinary block boundaries come directly from PyMuPDF.
 - Geometry detection favors false negatives and can miss tables with broken, unusually thick, or non-rectangular borders.

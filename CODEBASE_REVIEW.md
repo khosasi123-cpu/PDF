@@ -21,18 +21,18 @@ Prinsip arsitektur terpenting adalah model tidak boleh menghasilkan perintah dra
 
 Status verifikasi saat review:
 
-- `130` test lulus.
+- `152` test lulus.
 - `pip check` melaporkan tidak ada dependency yang rusak.
 - Tidak ada linting atau type checking yang dikonfigurasi.
 - Test integrasi dengan server LLM/vision nyata tidak dijalankan.
 
 ## Temuan Code Review
 
-### High 1: Rendering yang gagal tetap menyimpan PDF parsial
+### High 1 (resolved): Rendering yang gagal tetap menyimpan PDF parsial
 
 Referensi: `src/pdf_translator/render.py:1413-1415`, `src/pdf_translator/render.py:2126-2128`
 
-`document.save(output_path)` dijalankan di dalam `finally`. Jika exception terjadi di tengah loop rendering, file yang baru diproses sebagian tetap ditulis dan dapat terlihat seperti output sukses. Jika proses save ikut gagal, exception awal juga dapat tertutup dan `document.close()` tidak terjamin dijalankan.
+Renderer sekarang menyimpan hanya setelah seluruh eksekusi berhasil, membuka ulang temporary sibling untuk memvalidasi page count, lalu mempublikasikannya dengan atomic replace. Exception saat unit kedua tidak membuat output baru dan tidak mengubah output valid yang sudah ada.
 
 Dampak:
 
@@ -596,7 +596,7 @@ Karena default path standalone masih legacy, gunakan path eksplisit:
 Hasil saat review:
 
 ```text
-130 passed in 1.12s
+152 passed in 1.54s
 No broken requirements found.
 ```
 
@@ -616,7 +616,6 @@ No broken requirements found.
 
 Test yang masih kurang:
 
-- Atomicity output saat rendering exception.
 - CLI exit behavior untuk missing file, malformed JSON, invalid dictionary, dan invalid environment.
 - Translation network timeout dan transport retry.
 - Installed-wheel execution di luar repository root.
@@ -691,16 +690,15 @@ Project: Python PDF translator di C:\Users\USER\Documents\KERJAAN\PDF\PDF.
 
 Baca CODEBASE_REVIEW.md sebagai peta arsitektur dan hasil review terkini. Pipeline-nya adalah extraction -> semantic analysis -> optional vision LayoutPlan -> validated translation -> deterministic RenderPlan -> PyMuPDF overlay rendering. Vision hanya advisory; jangan izinkan model membuat code atau drawing command.
 
-Baseline terverifikasi: 130 pytest passed dan pip check bersih pada 2026-10-11.
+Baseline terverifikasi: 152 pytest passed dan pip check bersih pada 2026-10-12.
 
 Worktree sebelum CODEBASE_REVIEW.md dibuat sudah memiliki perubahan user pada .env, src/pdf_translator/layout_analysis.py, dan src/pdf_translator/main.py. Jangan revert perubahan tersebut. Jangan tampilkan isi .env.
 
 Risiko prioritas tertinggi:
-1. render.py menyimpan output dari finally sehingga exception dapat menghasilkan PDF parsial.
-2. .env tracked dan tidak di-ignore.
-3. endpoint remote tidak dibatasi walaupun project diklaim offline/local.
-4. retry translation tidak menangani transport failure utama.
-5. artifact legacy dapat melewati hash identity.
+1. .env tracked dan tidak di-ignore.
+2. endpoint remote tidak dibatasi walaupun project diklaim offline/local.
+3. retry translation tidak menangani transport failure utama.
+4. artifact legacy dapat melewati hash identity.
 
 Sebelum mengubah code, jalankan pytest. Setelah perubahan, jalankan full pytest dan pip check. Pertahankan source ownership, artifact hash validation, deterministic fallback, dan larangan model mengontrol drawing.
 ```
